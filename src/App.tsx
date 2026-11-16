@@ -15,7 +15,7 @@ import { Button, IconButton, SearchInput } from './components/ui';
 import { usePolling } from './hooks/usePolling';
 import { useTheme } from './hooks/useTheme';
 import { api } from './lib/api';
-import { appendSample, lastSample, toSample } from './lib/telemetry';
+import { appendSample, backoffDelay, lastSample, POLL_INTERVAL_MS, toSample } from './lib/telemetry';
 import type {
   AutoRun,
   ClusterState,
@@ -48,6 +48,12 @@ const ANALYZE_LOGS_COMMAND =
 
 const AUTO_SYNC_KEY = 'kubecast:auto-sync';
 const DEFAULT_PORT_KEY = 'kubecast:default-port';
+
+/** Per-host poll bookkeeping: consecutive failures and the next attempt time. */
+interface HostPollState {
+  failures: number;
+  nextAttemptAt: number;
+}
 
 function readAutoSync(): boolean {
   return window.localStorage.getItem(AUTO_SYNC_KEY) !== '0';
@@ -104,6 +110,12 @@ export default function App() {
   const serversRef = useRef<Server[]>(servers);
   serversRef.current = servers;
 
+  /**
+   * Backoff bookkeeping per host. Kept in a ref so a poll round never has to
+   * re-render to remember that a host is failing.
+   */
+  const pollStateRef = useRef<Record<string, HostPollState>>({});
+
   /* ── Data loading ───────────────────────────────────────── */
 
   const loadServers = useCallback(async () => {
@@ -134,12 +146,25 @@ export default function App() {
   /**
    * One telemetry poll for the whole fleet. Each host is fetched in parallel
    * and a single unreachable host cannot stall the rest.
+   *
+   * The loop itself always ticks at the base interval; a host that is backing
+   * off is simply skipped until its own next attempt is due. That keeps the
+   * usePolling contract (one chain, no overlap) while letting a dead host wait
+   * 10s/20s/30s without slowing down the hosts that are healthy.
    */
   const pollTelemetry = useCallback(async () => {
     const list = serversRef.current;
     if (!list.length) return;
 
-    const settled = await Promise.allSettled(list.map((server) => api.telemetry(server.id)));
+    const state = pollStateRef.current;
+    const startedAt = Date.now();
+    const due = list.filter((server) => {
+      const entry = state[server.id];
+      return !entry || entry.nextAttemptAt <= startedAt;
+    });
+    if (!due.length) return;
+
+    const settled = await Promise.allSettled(due.map((server) => api.telemetry(server.id)));
     // A fulfilled request means the API answered. Per-host failures come back as
     // 200 with an `error` field, so this is a true reachability signal.
     setBackendOk(settled.some((result) => result.status === 'fulfilled'));
@@ -147,10 +172,17 @@ export default function App() {
     const fresh: Array<[string, Telemetry]> = [];
 
     settled.forEach((result, index) => {
-      if (result.status !== 'fulfilled') return;
-      const payload = result.value;
-      if (!payload || payload.error) return;
-      fresh.push([list[index].id, payload]);
+      const id = due[index].id;
+      const payload = result.status === 'fulfilled' ? result.value : undefined;
+      // A rejected request and an `error` payload are the same thing here: this
+      // host missed a round, so it backs off while the others carry on.
+      if (!payload || payload.error) {
+        const failures = (state[id]?.failures ?? 0) + 1;
+        state[id] = { failures, nextAttemptAt: now + backoffDelay(failures) };
+        return;
+      }
+      state[id] = { failures: 0, nextAttemptAt: now + POLL_INTERVAL_MS };
+      fresh.push([id, payload]);
     });
 
     if (!fresh.length) return;
@@ -172,7 +204,13 @@ export default function App() {
     setLastSync(now);
   }, []);
 
-  usePolling(pollTelemetry, 30_000, { enabled: servers.length > 0 && autoSync });
+  usePolling(pollTelemetry, POLL_INTERVAL_MS, { enabled: servers.length > 0 && autoSync });
+
+  // Re-enabling automatic sync should not inherit a backoff window from before.
+  useEffect(() => {
+    if (!autoSync) return;
+    for (const entry of Object.values(pollStateRef.current)) entry.nextAttemptAt = 0;
+  }, [autoSync]);
 
   const refreshTelemetry = useCallback(async (id: string) => {
     try {
@@ -181,6 +219,8 @@ export default function App() {
       // The host may have been removed while the request was in flight.
       if (!serversRef.current.some((server) => server.id === id)) return;
       const now = Date.now();
+      // A manual refresh that worked clears any backoff for this host.
+      pollStateRef.current[id] = { failures: 0, nextAttemptAt: now + POLL_INTERVAL_MS };
       setTelemetry((prev) => ({ ...prev, [id]: payload }));
       setHistory((prev) => ({
         ...prev,
@@ -213,6 +253,7 @@ export default function App() {
     try {
       await api.deleteServer(id);
       setServers((prev) => prev.filter((server) => server.id !== id));
+      delete pollStateRef.current[id];
       setTelemetry((prev) => {
         const next = { ...prev };
         delete next[id];
@@ -234,6 +275,7 @@ export default function App() {
       const result = await api.destroyServer(id);
       if (result.success) {
         setServers((prev) => prev.filter((server) => server.id !== id));
+        delete pollStateRef.current[id];
         setTelemetry((prev) => {
           const next = { ...prev };
           delete next[id];

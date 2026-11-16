@@ -8,16 +8,20 @@ import {
   RefreshCw,
   Settings,
   Shield,
+  SlidersHorizontal,
   Terminal,
   Trash2,
 } from 'lucide-react';
 import { useState } from 'react';
+import { DEFAULT_THRESHOLDS, alertLabel, alertTone, evaluateHost } from '../lib/alerts';
+import type { Thresholds } from '../lib/alerts';
 import { api } from '../lib/api';
 import {
   bytes,
   clamp,
   fixed,
   num,
+  pct,
   percent,
   rate,
   severity,
@@ -111,6 +115,8 @@ export function ServerCard({
   server,
   telemetry,
   history,
+  thresholds,
+  onEditThresholds,
   onOpenTerminal,
   onOpenSettings,
   onDelete,
@@ -120,6 +126,9 @@ export function ServerCard({
   server: Server;
   telemetry?: Telemetry;
   history: Sample[];
+  /** Per-host alert thresholds; the defaults apply when omitted. */
+  thresholds?: Thresholds;
+  onEditThresholds?: () => void;
   onOpenTerminal: () => void;
   onOpenSettings: () => void;
   onDelete: () => void;
@@ -133,6 +142,17 @@ export function ServerCard({
   const ram = num(telemetry?.ram);
   const load1 = num(telemetry?.load1);
   const latest = lastSample(history);
+
+  // The alert badge reads the freshest numbers available: the live telemetry
+  // payload first, then the last recorded sample.
+  const alert = evaluateHost(
+    {
+      cpu: pct(telemetry?.cpu) ?? latest?.cpu,
+      ram: pct(telemetry?.ram) ?? latest?.ram,
+      disk: pct(telemetry?.disk),
+    },
+    thresholds ?? DEFAULT_THRESHOLDS,
+  );
 
   // Telemetry is authoritative when present; fall back to what the server
   // record already knows so the card is never blank before the first poll.
@@ -192,6 +212,11 @@ export function ServerCard({
           <IconButton label="Open terminal" onClick={onOpenTerminal}>
             <Terminal size={13} strokeWidth={1.75} />
           </IconButton>
+          {onEditThresholds && (
+            <IconButton label="Alert thresholds" onClick={onEditThresholds}>
+              <SlidersHorizontal size={13} strokeWidth={1.75} />
+            </IconButton>
+          )}
           <IconButton label="Remove host" danger onClick={onDelete}>
             <Trash2 size={13} strokeWidth={1.75} />
           </IconButton>
@@ -222,6 +247,13 @@ export function ServerCard({
             k="K8s runtime"
             v={<Badge tone={k8sActive ? 'ok' : 'muted'}>{k8sActive ? 'Active' : 'Not a node'}</Badge>}
           />
+          {alert.hasData && (
+            <KV
+              k="Alerts"
+              title={alert.summary}
+              v={<Badge tone={alertTone(alert.level)}>{alertLabel(alert.level)}</Badge>}
+            />
+          )}
           <KV k="Uptime" v={uptime(num(telemetry?.uptime_s))} />
           <KV k="Load 1m" v={fixed(load1, 2)} />
         </div>

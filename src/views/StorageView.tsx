@@ -1,4 +1,5 @@
 import { ArrowRight, HardDrive } from 'lucide-react';
+import { useMemo } from 'react';
 import { pct, percent, severity, severityTone } from '../lib/format';
 import type { Server, Telemetry } from '../types';
 import { Badge, Button, Dot, EmptyState, KV, Meter } from '../components/ui';
@@ -64,6 +65,32 @@ function parseMounts(raw: string | undefined): Mount[] {
 /** `.table thead th` sets text-align: left, so numeric headers need it inline. */
 const NUM_HEAD = { textAlign: 'right' } as const;
 
+/* ── Cleanup analysis ─────────────────────────────────────── */
+
+/** A mount at or above these percentages needs attention. */
+const MOUNT_WARN = 80;
+const MOUNT_CRITICAL = 90;
+
+/** Badge tone for a mount, or undefined while it is comfortably below 80%. */
+function mountTone(value: number | undefined): 'warn' | 'err' | undefined {
+  if (value === undefined) return undefined;
+  if (value >= MOUNT_CRITICAL) return 'err';
+  if (value >= MOUNT_WARN) return 'warn';
+  return undefined;
+}
+
+function mountFlag(value: number | undefined): string | undefined {
+  const tone = mountTone(value);
+  if (tone === 'err') return 'Critical';
+  if (tone === 'warn') return 'High';
+  return undefined;
+}
+
+/** Fullest mounts first; a mount with no percentage sorts last. */
+function sortByUsage(mounts: Mount[]): Mount[] {
+  return [...mounts].sort((a, b) => (b.percent ?? -1) - (a.percent ?? -1));
+}
+
 function statusTone(status: Server['status']): 'ok' | 'warn' | 'err' | 'idle' {
   if (status === 'online') return 'ok';
   if (status === 'error') return 'err';
@@ -80,7 +107,9 @@ function StorageCard({
   onAnalyzeLogs: (server: Server) => void;
 }) {
   const usage = pct(telemetry?.disk);
-  const mounts = parseMounts(telemetry?.disk_usage_all);
+  const raw = telemetry?.disk_usage_all;
+  // Fullest mounts first, so the ones that need cleanup are always on top.
+  const mounts = useMemo(() => sortByUsage(parseMounts(raw)), [raw]);
   const heavy = usage !== undefined && usage > 80;
 
   const analyze = () => {
@@ -133,27 +162,31 @@ function StorageCard({
             </tr>
           </thead>
           <tbody>
-            {mounts.map((mount, index) => (
-              <tr key={`${mount.source}:${mount.target}:${index}`}>
-                <td>
-                  <div className="mono truncate" title={mount.target}>
-                    {mount.target}
-                  </div>
-                  <div className="card__meta truncate">{mount.source}</div>
-                </td>
-                <td className="table__num">{mount.size}</td>
-                <td className="table__num">{mount.used}</td>
-                <td className="table__num">{mount.avail}</td>
-                <td className="table__num">
-                  <div className="row justify-end gap-2">
-                    <span className="num">{percent(mount.percent)}</span>
-                    <div style={{ width: 44 }}>
-                      <Meter value={mount.percent} tone={severityTone(mount.percent)} />
+            {mounts.map((mount, index) => {
+              const tone = mountTone(mount.percent);
+              return (
+                <tr key={`${mount.source}:${mount.target}:${index}`}>
+                  <td>
+                    <div className="mono truncate" title={mount.target}>
+                      {mount.target}
                     </div>
-                  </div>
-                </td>
-              </tr>
-            ))}
+                    <div className="card__meta truncate">{mount.source}</div>
+                  </td>
+                  <td className="table__num">{mount.size}</td>
+                  <td className="table__num">{mount.used}</td>
+                  <td className="table__num">{mount.avail}</td>
+                  <td className="table__num">
+                    <div className="row justify-end gap-2">
+                      {tone && <Badge tone={tone}>{mountFlag(mount.percent)}</Badge>}
+                      <span className="num">{percent(mount.percent)}</span>
+                      <div style={{ width: 44 }}>
+                        <Meter value={mount.percent} tone={severityTone(mount.percent)} />
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       ) : (

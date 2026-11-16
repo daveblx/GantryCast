@@ -1,9 +1,18 @@
-import { Server as ServerIcon } from 'lucide-react';
-import { useMemo } from 'react';
-import { pct } from '../lib/format';
-import type { Sample, Server, Telemetry } from '../types';
+import { Download, Server as ServerIcon } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
+import { AlertThresholdsModal } from '../components/modals/AlertThresholdsModal';
 import { ServerCard } from '../components/ServerCard';
 import { Button, Dot, EmptyState, Stat } from '../components/ui';
+import {
+  readThresholds,
+  thresholdsFor,
+  writeThresholds,
+  type ThresholdMap,
+  type Thresholds,
+} from '../lib/alerts';
+import { countTelemetryRows, exportTelemetryCsv } from '../lib/csv';
+import { pct } from '../lib/format';
+import type { Sample, Server, Telemetry } from '../types';
 
 /**
  * Mean utilisation across every host that reported telemetry. A host that only
@@ -55,6 +64,26 @@ export function FleetView({
   const k8sNodes = servers.filter((server) => server.installed?.k8s).length;
   const load = useMemo(() => meanLoad(servers, telemetry), [servers, telemetry]);
 
+  // Alert thresholds live in localStorage, so the view owns the map and hands
+  // each card only its own entry.
+  const [thresholds, setThresholds] = useState<ThresholdMap>(readThresholds);
+  const [editingThresholds, setEditingThresholds] = useState<Server | null>(null);
+
+  const saveThresholds = useCallback((hostId: string, next: Thresholds) => {
+    setThresholds((prev) => {
+      const map = { ...prev, [hostId]: next };
+      writeThresholds(map);
+      return map;
+    });
+    setEditingThresholds(null);
+  }, []);
+
+  const exportRows = useMemo(() => countTelemetryRows(servers, history), [servers, history]);
+
+  const exportCsv = useCallback(() => {
+    exportTelemetryCsv(servers, history);
+  }, [servers, history]);
+
   const visible = useMemo(() => {
     const sorted = [...servers].sort((a, b) => {
       const aOnline = a.status === 'online' ? 1 : 0;
@@ -74,6 +103,26 @@ export function FleetView({
 
   return (
     <div className="view">
+      <div className="view__head">
+        <div>
+          <p className="view__sub">Every managed host, with live telemetry from the SSH poll.</p>
+        </div>
+        <div className="view__actions">
+          <Button
+            onClick={exportCsv}
+            disabled={exportRows === 0}
+            title={
+              exportRows === 0
+                ? 'No telemetry history collected yet'
+                : `Download ${exportRows} telemetry samples as CSV`
+            }
+          >
+            <Download size={13} strokeWidth={1.75} />
+            Export CSV
+          </Button>
+        </div>
+      </div>
+
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <Stat
           label="Active Nodes"
@@ -150,6 +199,8 @@ export function FleetView({
               server={server}
               telemetry={telemetry[server.id]}
               history={history[server.id] ?? []}
+              thresholds={thresholdsFor(thresholds, server.id)}
+              onEditThresholds={() => setEditingThresholds(server)}
               onOpenTerminal={() => onOpenTerminal(server)}
               onOpenSettings={() => onOpenSettings(server)}
               onDelete={() => onDelete(server.id)}
@@ -158,6 +209,15 @@ export function FleetView({
             />
           ))}
         </div>
+      )}
+
+      {editingThresholds && (
+        <AlertThresholdsModal
+          server={editingThresholds}
+          thresholds={thresholdsFor(thresholds, editingThresholds.id)}
+          onSave={(next) => saveThresholds(editingThresholds.id, next)}
+          onClose={() => setEditingThresholds(null)}
+        />
       )}
     </div>
   );

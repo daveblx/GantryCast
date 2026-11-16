@@ -1,35 +1,82 @@
 import type { Sample, Telemetry } from '../types';
 import { num, pct } from './format';
 
-/** How many samples to retain per server. 120 × 30s ≈ 1 hour. */
-export const HISTORY_LIMIT = 120;
+/* ── Polling cadence ──────────────────────────────────────── */
+
+/** Base telemetry poll interval. */
+export const POLL_INTERVAL_MS = 5_000;
+
+/**
+ * A host is stale once its last good sample is older than this. Three missed
+ * rounds is long enough to ride out one slow SSH handshake and short enough
+ * that a dead host never keeps showing numbers as if they were live.
+ */
+export const STALE_AFTER_MS = POLL_INTERVAL_MS * 3;
+
+/**
+ * Backoff ladder for a host whose poll keeps failing: 5s → 10s → 20s → 30s,
+ * then capped. Only the failing host waits; the rest of the fleet keeps the
+ * base cadence.
+ */
+export const BACKOFF_STEPS_MS = [5_000, 10_000, 20_000, 30_000] as const;
+
+/** Delay before the next attempt for a host with `failures` consecutive misses. */
+export function backoffDelay(failures: number): number {
+  if (failures <= 0) return POLL_INTERVAL_MS;
+  const index = Math.min(failures, BACKOFF_STEPS_MS.length - 1);
+  return BACKOFF_STEPS_MS[index];
+}
+
+/** True when the last successful sample is too old to be presented as live. */
+export function isStale(ts: number | undefined, now = Date.now()): boolean {
+  if (!ts) return true;
+  return now - ts > STALE_AFTER_MS;
+}
+
+/* ── Samples ──────────────────────────────────────────────── */
+
+/** How many samples to retain per server. 720 × 5s ≈ 1 hour. */
+export const HISTORY_LIMIT = 720;
+
+/**
+ * Rate from two consecutive cumulative counters. A counter that went backwards
+ * means the interface or disk was reset (reboot, device re-attach), so the rate
+ * is dropped rather than reported as negative.
+ */
+function deriveRate(
+  current: number | undefined,
+  previous: number | undefined,
+  seconds: number | undefined,
+): number | undefined {
+  if (current === undefined || previous === undefined || seconds === undefined) return undefined;
+  if (current < previous) return undefined;
+  return (current - previous) / seconds;
+}
+
+/** `temp_c` is the literal string "none" when the host exposes no thermal zone. */
+function temperature(value: string | undefined): number | undefined {
+  if (!value || value.trim().toLowerCase() === 'none') return undefined;
+  return num(value);
+}
 
 /**
  * Convert a raw telemetry payload into a chartable sample.
  *
- * `net_rx_mb` / `net_tx_mb` are cumulative counters since boot, so a rate can
- * only be derived by diffing against the previous sample. When the counter
- * appears to have gone backwards the interface was reset (reboot, or a NIC
- * coming back), so the rate is dropped rather than reported as negative.
+ * `net_rx_mb` / `net_tx_mb` and `disk_read_kb` / `disk_write_kb` are cumulative
+ * counters since boot, so a rate can only be derived by diffing against the
+ * previous sample. When a counter appears to have gone backwards the interface
+ * or device was reset, so the rate is dropped rather than reported as negative.
  */
 export function toSample(raw: Telemetry, ts: number, previous?: Sample): Sample {
   const rxMb = num(raw.net_rx_mb);
   const txMb = num(raw.net_tx_mb);
+  const diskReadKb = num(raw.disk_read_kb);
+  const diskWriteKb = num(raw.disk_write_kb);
 
-  let rxRate: number | undefined;
-  let txRate: number | undefined;
-
-  if (previous && previous.ts > 0 && ts > previous.ts) {
-    const dt = (ts - previous.ts) / 1000;
-    if (dt > 0.5) {
-      if (rxMb !== undefined && previous.rxMb !== undefined && rxMb >= previous.rxMb) {
-        rxRate = (rxMb - previous.rxMb) / dt;
-      }
-      if (txMb !== undefined && previous.txMb !== undefined && txMb >= previous.txMb) {
-        txRate = (txMb - previous.txMb) / dt;
-      }
-    }
-  }
+  // A sub-second gap is too short to divide by without amplifying jitter.
+  const elapsed =
+    previous && previous.ts > 0 && ts > previous.ts ? (ts - previous.ts) / 1000 : undefined;
+  const seconds = elapsed !== undefined && elapsed > 0.5 ? elapsed : undefined;
 
   return {
     ts,
@@ -40,8 +87,16 @@ export function toSample(raw: Telemetry, ts: number, previous?: Sample): Sample 
     load15: num(raw.load15),
     rxMb,
     txMb,
-    rxRate,
-    txRate,
+    rxRate: deriveRate(rxMb, previous?.rxMb, seconds),
+    txRate: deriveRate(txMb, previous?.txMb, seconds),
+    swapUsedMb: num(raw.swap_used_mb),
+    swapTotalMb: num(raw.swap_total_mb),
+    diskReadKb,
+    diskWriteKb,
+    diskReadRate: deriveRate(diskReadKb, previous?.diskReadKb, seconds),
+    diskWriteRate: deriveRate(diskWriteKb, previous?.diskWriteKb, seconds),
+    procCount: num(raw.proc_count),
+    tempC: temperature(raw.temp_c),
   };
 }
 

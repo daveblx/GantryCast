@@ -11,6 +11,7 @@ import { rateLimit } from "express-rate-limit";
 import crypto from "crypto";
 import { deployTemplate, TemplateConfig } from "./src/deploy/template";
 import { PROD_TEST_COMMAND } from "./src/shared/probes";
+import { closeAll as closeSshPool, closeHost as closePooledHost, execOnServer, SshPoolError } from "./src/lib/ssh-pool";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -106,6 +107,118 @@ function shellSanitize(text: string, password?: string): string {
   return text.replace(new RegExp(escaped, 'g'), '********');
 }
 
+// ─── Telemetry collection ──────────────────────────────────────
+// One round trip per poll: every metric is printed as a "key: value" line so
+// the parser stays a single split, and the whole script is POSIX sh so it runs
+// on any host we can reach over SSH.
+//
+// The CPU sample sleeps 200ms between the two /proc/stat reads: long enough for
+// the delta to be meaningful, short enough to sit comfortably inside the 8s
+// request budget next to df, docker --version and k3s --version.
+const TELEMETRY_SCRIPT = `
+# A non-C locale makes awk print "75,0" and df print localised units, which the
+# parser and the frontend both read as numbers.
+LC_ALL=C; export LC_ALL
+
+echo "disk: $(df -h / | tail -1 | awk '{print $5}')"
+echo "disk_free: $(df -h / | tail -1 | awk '{print $4}')"
+echo "disk_total: $(df -h / | tail -1 | awk '{print $2}')"
+echo "disk_usage_all: $(df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2 | tr '\\n' ';')"
+
+t1=0; i1=0
+set -- $(awk '/^cpu /{t=0;for(i=2;i<=9;i++)t+=$i;print t, $5}' /proc/stat 2>/dev/null)
+if [ -n "$1" ]; then t1=$1; fi
+if [ -n "$2" ]; then i1=$2; fi
+sleep 0.2
+t2=0; i2=0
+set -- $(awk '/^cpu /{t=0;for(i=2;i<=9;i++)t+=$i;print t, $5}' /proc/stat 2>/dev/null)
+if [ -n "$1" ]; then t2=$1; fi
+if [ -n "$2" ]; then i2=$2; fi
+dt=$((t2-t1)); di=$((i2-i1))
+if [ "$dt" -gt 0 ]; then
+  echo "cpu: $(awk -v dt="$dt" -v di="$di" 'BEGIN{printf "%.1f", (1-(di/dt))*100}')"
+else
+  echo "cpu: 0"
+fi
+echo "cpu_cores: $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
+
+ram=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if (t>0) printf "%.1f", ((t-a)/t)*100; else printf "0"}' /proc/meminfo 2>/dev/null)
+if [ -z "$ram" ]; then ram=0; fi
+echo "ram: $ram"
+echo "ram_total_mb: $(awk '/^MemTotal:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+echo "ram_available_mb: $(awk '/^MemAvailable:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+echo "swap_total_mb: $(awk '/^SwapTotal:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+swap_used=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{if (t>0) printf "%.0f", (t-f)/1024; else printf "0"}' /proc/meminfo 2>/dev/null)
+if [ -z "$swap_used" ]; then swap_used=0; fi
+echo "swap_used_mb: $swap_used"
+
+echo "load1: $(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)"
+echo "load5: $(awk '{print $2}' /proc/loadavg 2>/dev/null || echo 0)"
+echo "load15: $(awk '{print $3}' /proc/loadavg 2>/dev/null || echo 0)"
+echo "uptime_s: $(awk '{printf "%.0f", $1}' /proc/uptime 2>/dev/null || echo 0)"
+
+echo "net_rx_mb: $(awk -F'[: ]+' 'NR>2 {rx+=$3} END {printf "%.1f", rx/1024/1024}' /proc/net/dev 2>/dev/null || echo 0)"
+echo "net_tx_mb: $(awk -F'[: ]+' 'NR>2 {tx+=$11} END {printf "%.1f", tx/1024/1024}' /proc/net/dev 2>/dev/null || echo 0)"
+
+# /proc/diskstats counts 512-byte sectors. Partitions and stacked devices are
+# skipped so a disk is not counted once per layer (sda + sda1 + dm-0).
+dr=$(awk '$3 !~ /^(loop|ram|sr|fd|dm-|md)/ { n=$3; if (n ~ /[0-9]$/ && n !~ /^(nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/) next; r+=$6 } END {printf "%.0f", r/2}' /proc/diskstats 2>/dev/null)
+if [ -z "$dr" ]; then dr=0; fi
+echo "disk_read_kb: $dr"
+dw=$(awk '$3 !~ /^(loop|ram|sr|fd|dm-|md)/ { n=$3; if (n ~ /[0-9]$/ && n !~ /^(nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/) next; w+=$10 } END {printf "%.0f", w/2}' /proc/diskstats 2>/dev/null)
+if [ -z "$dw" ]; then dw=0; fi
+echo "disk_write_kb: $dw"
+
+pc=$(ls /proc 2>/dev/null | grep -c '^[0-9][0-9]*$' || true)
+if [ -z "$pc" ]; then pc=0; fi
+echo "proc_count: $pc"
+
+# Thermal zones first (millidegrees), then hwmon for hosts without them.
+temp_raw=""
+for z in /sys/class/thermal/thermal_zone*; do
+  if [ -r "$z/temp" ]; then
+    v=$(cat "$z/temp" 2>/dev/null)
+    case "$v" in ''|*[!0-9-]*) continue ;; esac
+    if [ "$v" -gt 1000 ]; then temp_raw=$v; break; fi
+  fi
+done
+if [ -z "$temp_raw" ]; then
+  for h in /sys/class/hwmon/hwmon*; do
+    if [ -r "$h/temp1_input" ]; then
+      v=$(cat "$h/temp1_input" 2>/dev/null)
+      case "$v" in ''|*[!0-9-]*) continue ;; esac
+      if [ "$v" -gt 1000 ]; then temp_raw=$v; break; fi
+    fi
+  done
+fi
+if [ -n "$temp_raw" ]; then
+  echo "temp_c: $(awk -v v="$temp_raw" 'BEGIN{printf "%.1f", v/1000}')"
+else
+  echo "temp_c: none"
+fi
+
+os_name=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -1 | tr -d '"')
+if [ -z "$os_name" ]; then os_name=unknown; fi
+echo "os: $os_name"
+echo "kernel: $(uname -r 2>/dev/null || echo unknown)"
+
+echo "docker: $(docker --version 2>/dev/null || echo 'none')"
+echo "k3s: $(k3s --version 2>/dev/null || echo 'none')"
+`;
+
+/** Parse the "key: value" lines the telemetry script prints. */
+function parseTelemetry(output: string): Record<string, string> {
+  const stats: Record<string, string> = {};
+  for (const line of output.split("\n")) {
+    const colonIdx = line.indexOf(": ");
+    if (colonIdx === -1) continue;
+    const key = line.substring(0, colonIdx).trim();
+    const value = line.substring(colonIdx + 2).trim();
+    if (key) stats[key] = value;
+  }
+  return stats;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -155,6 +268,11 @@ async function startServer() {
     const db = getDB();
     db.servers = db.servers.filter((s: any) => s.id !== req.params.id);
     saveDB(db);
+    // Drop the pooled connection and the per-host telemetry state too, so a
+    // deleted host leaves nothing behind.
+    closePooledHost(req.params.id);
+    telemetryCache.delete(req.params.id);
+    telemetryFailures.delete(req.params.id);
     res.status(204).end();
   });
 
@@ -802,6 +920,94 @@ async function startServer() {
     res.status(204).end();
   });
 
+  // ─── Telemetry ────────────────────────────────────────────────
+  // Polled every 5s per host, so the route is built around three guards: a
+  // pooled SSH connection (no handshake per poll), a short result cache plus
+  // in-flight de-duplication (a burst of polls costs one exec), and a hard 8s
+  // budget (a hung host must not pin a request).
+  const TELEMETRY_TIMEOUT_MS = 8_000;
+  const TELEMETRY_CACHE_MS = 2_000;
+  // One dropped packet must not flip a healthy host to "offline" in the UI.
+  const TELEMETRY_OFFLINE_AFTER = 3;
+
+  type TelemetryPayload = Record<string, string>;
+
+  const telemetryCache = new Map<string, { at: number; payload: TelemetryPayload }>();
+  const telemetryInFlight = new Map<string, Promise<TelemetryPayload>>();
+  const telemetryFailures = new Map<string, number>();
+
+  class TelemetryTimeoutError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "TelemetryTimeoutError";
+    }
+  }
+
+  function markHostOffline(id: string) {
+    const freshDb = getDB();
+    const srv = freshDb.servers.find((s: any) => s.id === id);
+    if (srv && srv.status !== "offline") {
+      srv.status = "offline";
+      saveDB(freshDb);
+    }
+  }
+
+  function recordTelemetrySuccess(server: any, stats: TelemetryPayload) {
+    const freshDb = getDB();
+    const srv = freshDb.servers.find((s: any) => s.id === server.id);
+    if (srv) {
+      const dockerInstalled = !!(stats.docker && stats.docker !== "none");
+      const k8sInstalled = !!(stats.k3s && stats.k3s !== "none");
+      const installed = srv.installed ?? { docker: false, k8s: false };
+      // Only touch the file when something actually changed: this runs on every
+      // poll of every host.
+      if (
+        srv.status !== "online" ||
+        installed.docker !== dockerInstalled ||
+        installed.k8s !== k8sInstalled
+      ) {
+        srv.status = "online";
+        srv.installed = { ...installed, docker: dockerInstalled, k8s: k8sInstalled };
+        saveDB(freshDb);
+      }
+    }
+    telemetryFailures.delete(server.id);
+    telemetryCache.set(server.id, { at: Date.now(), payload: stats });
+  }
+
+  function recordTelemetryFailure(server: any) {
+    const failures = (telemetryFailures.get(server.id) ?? 0) + 1;
+    telemetryFailures.set(server.id, failures);
+    if (failures >= TELEMETRY_OFFLINE_AFTER) markHostOffline(server.id);
+  }
+
+  async function collectTelemetry(server: any): Promise<TelemetryPayload> {
+    // The abort controller is the hard deadline: it kills the remote command
+    // and rejects, so a host that stops answering cannot hold the request open.
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), TELEMETRY_TIMEOUT_MS);
+    try {
+      const result = await execOnServer(server, TELEMETRY_SCRIPT, {
+        timeoutMs: TELEMETRY_TIMEOUT_MS,
+        signal: controller.signal,
+        retries: 1,
+      });
+      const stats = parseTelemetry(result.stdout);
+      recordTelemetrySuccess(server, stats);
+      return stats;
+    } catch (err) {
+      recordTelemetryFailure(server);
+      if (err instanceof SshPoolError && (err.code === "timeout" || err.code === "aborted")) {
+        throw new TelemetryTimeoutError(
+          `Telemetry collection for ${server.name || server.host} timed out after ${TELEMETRY_TIMEOUT_MS / 1000}s`,
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
   app.get("/api/servers/:id/telemetry", async (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
@@ -810,82 +1016,32 @@ async function startServer() {
       return;
     }
 
-    const conn = new Client();
+    // A burst of polls (tab focus, several clients) must cost one exec.
+    const cached = telemetryCache.get(server.id);
+    if (cached && Date.now() - cached.at < TELEMETRY_CACHE_MS) {
+      res.json(cached.payload);
+      return;
+    }
 
-    // A failed poll is the only signal we get that a host went away, so it has
-    // to flip the stored status back — otherwise a host that dies stays
-    // "online" in the UI forever.
-    const markOffline = () => {
-      const freshDb = getDB();
-      const srv = freshDb.servers.find((s: any) => s.id === req.params.id);
-      if (srv && srv.status !== "offline") {
-        srv.status = "offline";
-        saveDB(freshDb);
-      }
-    };
+    // De-duplicate per host: a poll already in flight is shared, not repeated.
+    let pending = telemetryInFlight.get(server.id);
+    if (!pending) {
+      pending = collectTelemetry(server).finally(() => {
+        telemetryInFlight.delete(server.id);
+      });
+      telemetryInFlight.set(server.id, pending);
+    }
 
-    conn
-      .on("ready", () => {
-        const cmd = `
-          echo "disk: $(df -h / | tail -1 | awk '{print $5}')"
-          echo "disk_free: $(df -h / | tail -1 | awk '{print $4}')"
-          echo "disk_total: $(df -h / | tail -1 | awk '{print $2}')"
-          echo "disk_usage_all: $(df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs | tail -n +2 | tr '\n' ';')"
-          echo "cpu: $(sh -lc 'if [ -r /proc/stat ]; then read -r _ u n s i iw irq sir st g gn < /proc/stat; t1=$((u+n+s+i+iw+irq+sir+st)); idle1=$i; sleep 0.5; read -r _ u n s i iw irq sir st g gn < /proc/stat; t2=$((u+n+s+i+iw+irq+sir+st)); idle2=$i; dt=$((t2-t1)); didle=$((idle2-idle1)); if [ \"$dt\" -gt 0 ]; then awk \"BEGIN { printf \\\"%.1f\\\", (1-($didle/$dt))*100 }\"; else echo 0; fi; else echo 0; fi')"
-          echo "ram: $(sh -lc 'if [ -r /proc/meminfo ]; then total=$(awk \"/^MemTotal:/ {print \\$2}\" /proc/meminfo); avail=$(awk \"/^MemAvailable:/ {print \\$2}\" /proc/meminfo); if [ -n \"$total\" ] && [ -n \"$avail\" ] && [ \"$total\" -gt 0 ]; then awk \"BEGIN { printf \\\"%.1f\\\", (($total-$avail)/$total)*100 }\"; else echo 0; fi; else echo 0; fi')"
-          echo "ram_total_mb: $(sh -lc 'awk \"/^MemTotal:/ { printf \\\"%.0f\\\", \\$2/1024 }\" /proc/meminfo 2>/dev/null || echo 0')"
-          echo "ram_available_mb: $(sh -lc 'awk \"/^MemAvailable:/ { printf \\$2/1024 }\" /proc/meminfo 2>/dev/null || echo 0')"
-          echo "swap_used_mb: $(sh -lc 'if [ -r /proc/meminfo ]; then st=$(awk \"/^SwapTotal:/ {print \\$2}\" /proc/meminfo); sf=$(awk \"/^SwapFree:/ {print \\$2}\" /proc/meminfo); if [ -n \"$st\" ] && [ -n \"$sf\" ]; then awk \"BEGIN { printf \\\"%.0f\\\", (($st-$sf)/1024) }\"; else echo 0; fi; else echo 0; fi')"
-          echo "load1: $(sh -lc 'awk \"{print \\$1}\" /proc/loadavg 2>/dev/null || echo 0')"
-          echo "load5: $(sh -lc 'awk \"{print \\$2}\" /proc/loadavg 2>/dev/null || echo 0')"
-          echo "load15: $(sh -lc 'awk \"{print \\$3}\" /proc/loadavg 2>/dev/null || echo 0')"
-          echo "uptime_s: $(sh -lc 'awk \"{printf \\\"%.0f\\\", \\$1}\" /proc/uptime 2>/dev/null || echo 0')"
-          echo "net_rx_mb: $(sh -lc 'awk -F\"[: ]+\" \"NR>2 {rx+=\\$3} END {printf \\\"%.1f\\\", rx/1024/1024}\" /proc/net/dev 2>/dev/null || echo 0')"
-          echo "net_tx_mb: $(sh -lc 'awk -F\"[: ]+\" \"NR>2 {tx+=\\$11} END {printf \\\"%.1f\\\", tx/1024/1024}\" /proc/net/dev 2>/dev/null || echo 0')"
-          echo "docker: $(docker --version 2>/dev/null || echo 'none')"
-          echo "k3s: $(k3s --version 2>/dev/null || echo 'none')"
-        `;
-
-        conn.exec(cmd, (err, stream) => {
-          if (err) {
-            conn.end();
-            markOffline();
-            res.status(500).json({ error: err.message });
-            return;
-          }
-          let output = "";
-          stream.on("data", (data: Buffer) => (output += data.toString()));
-          stream.on("close", () => {
-            conn.end();
-            const stats: any = {};
-            output.split("\n").forEach((line) => {
-              const colonIdx = line.indexOf(": ");
-              if (colonIdx !== -1) {
-                const key = line.substring(0, colonIdx).trim();
-                const val = line.substring(colonIdx + 2).trim();
-                if (key) stats[key] = val;
-              }
-            });
-
-            const freshDb = getDB();
-            const srv = freshDb.servers.find((s: any) => s.id === req.params.id);
-            if (srv) {
-              srv.status = "online";
-              srv.installed.docker = !!(stats.docker && stats.docker !== "none");
-              srv.installed.k8s = !!(stats.k3s && stats.k3s !== "none");
-              saveDB(freshDb);
-            }
-
-            res.json(stats);
-          });
-        });
-      })
-      .on("error", (err: any) => {
-        markOffline();
-        res.status(500).json({ error: "Connection failed: " + err.message });
+    try {
+      res.json(await pending);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof TelemetryTimeoutError) {
+        res.status(504).json({ error: message });
         return;
-      })
-      .connect(getServerSSHConfig(server));
+      }
+      res.status(500).json({ error: message });
+    }
   });
 
   // Loopback by default: this process holds root SSH credentials for every
@@ -894,6 +1050,16 @@ async function startServer() {
   const httpServer = app.listen(PORT, HOST, () => {
     console.log(`Server running on http://${HOST}:${PORT}`);
   });
+
+  // Pooled SSH connections are long-lived, so they have to be torn down
+  // explicitly or the process lingers after a restart.
+  const shutdown = () => {
+    closeSshPool();
+    process.exit(0);
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+  process.once("exit", () => closeSshPool());
 
   const wss = new WebSocketServer({ server: httpServer, path: "/ws/ssh" });
 
