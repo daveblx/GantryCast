@@ -88,29 +88,42 @@ export async function deployTemplate(params: {
       // Use bash -s to execute the command safely via stdin
       const shellCmd = `sudo -S -p "${SUDO_PROMPT}" bash -s`;
 
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(ok);
+      };
+
       sshClient.exec(shellCmd, (err, stream) => {
-        if (err) { error(`SSH Error: ${err.message}`); return resolve(false); }
-        
+        if (err) { error(`SSH Error: ${err.message}`); finish(false); return; }
+
         // Send password first for sudo -S, then the command
         stream.write(sudoPassword + "\n");
         stream.write(cmd + "\n");
         stream.end();
 
-        stream.on("data", (chunk: Buffer) => {
-          const text = chunk.toString();
-          if (text.includes(SUDO_PROMPT)) {
-            // Already sent, but handle just in case it prompts again
-            stream.write(sudoPassword + "\n");
-            return;
-          }
-          safeWsSend({ type: "data", data: sanitize(text) });
+        // The password is sent exactly once, above. Re-sending it on any chunk
+        // that happens to contain the prompt marker would type it into the
+        // shell as a command, so every chunk is simply forwarded.
+        const forward = (chunk: Buffer) => {
+          safeWsSend({ type: "data", data: sanitize(chunk.toString()) });
+        };
+
+        stream.on("data", forward);
+        // stderr carries the actual reason a step failed; dropping it left the
+        // user with only "Step X failed code N".
+        stream.stderr.on("data", forward);
+        stream.on("error", (streamErr: Error) => {
+          error(`Step ${stepName} errored: ${streamErr.message}`);
+          finish(false);
         });
 
         stream.on("close", (code: number) => {
-          if (code === 0) resolve(true);
+          if (code === 0) finish(true);
           else {
-            if (stopOnError) { error(`Step ${stepName} failed code ${code}`); resolve(false); }
-            else resolve(true);
+            if (stopOnError) { error(`Step ${stepName} failed code ${code}`); finish(false); }
+            else finish(true);
           }
         });
       });

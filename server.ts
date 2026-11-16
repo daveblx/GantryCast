@@ -9,17 +9,19 @@ import cors from "cors";
 import multer from "multer";
 import { rateLimit } from "express-rate-limit";
 import crypto from "crypto";
-import os from "os";
 import { deployTemplate, TemplateConfig } from "./src/deploy/template";
+import { PROD_TEST_COMMAND } from "./src/shared/probes";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const upload = multer({ dest: "/tmp" });
 
+// The dashboard polls telemetry and container stats continuously, so the budget
+// has to cover the app's own traffic: roughly 8 requests per minute per host.
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 5000, // ~330 requests per minute, enough for a fleet of ~40 hosts
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -29,7 +31,7 @@ const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "db.json");
 
 // Ensure sync DB for simple state
 if (!fs.existsSync(DB_PATH)) {
-  fs.writeFileSync(DB_PATH, JSON.stringify({ servers: [], clusters: [] }));
+  fs.writeFileSync(DB_PATH, JSON.stringify({ servers: [], clusters: [] }), { mode: 0o600 });
 }
 
 function getDB() {
@@ -37,7 +39,11 @@ function getDB() {
 }
 
 function saveDB(db: any) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  // The file holds SSH passwords and private keys, so it is owner-only and
+  // written through a temp file: a crash mid-write must not truncate the fleet.
+  const tmpPath = `${DB_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2), { mode: 0o600 });
+  fs.renameSync(tmpPath, DB_PATH);
 }
 
 // ─── Allowed commands allowlist for /exec ─────────────────────
@@ -60,6 +66,9 @@ const ALLOWED_EXEC_COMMANDS = new Set([
   "k3s kubectl get pods",
   "systemctl status docker",
   "systemctl status k3s",
+  // The Prod Test probe on the host card. Shared with the renderer so the two
+  // copies cannot drift apart and start returning 403.
+  PROD_TEST_COMMAND,
 ]);
 
 // ─── Safe remote path validator ────────────────────────────────
@@ -99,14 +108,15 @@ function shellSanitize(text: string, password?: string): string {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(cors({
     origin: ["http://localhost:5173", "http://localhost:3000"],
     methods: ["GET", "POST", "PUT", "DELETE"]
   }));
   app.use(express.json());
-  app.use(limiter);
+  // Scoped to the API so static assets and Vite's dev modules are not counted.
+  app.use("/api", limiter);
 
   // Server Management API
   app.get("/api/servers", (_req: Request, res: Response) => {
@@ -120,6 +130,7 @@ async function startServer() {
 
     if (!name || !host || !username) {
       res.status(400).json({ error: "name, host, and username are required" });
+      return;
     }
 
     const db = getDB();
@@ -165,7 +176,10 @@ async function startServer() {
   app.get("/api/servers/:id", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
     const { password: _, privateKey: __, ...sanitized } = server;
     res.json(sanitized);
   });
@@ -173,7 +187,10 @@ async function startServer() {
   app.put("/api/servers/:id", (req: Request, res: Response) => {
     const db = getDB();
     const idx = db.servers.findIndex((s: any) => s.id === req.params.id);
-    if (idx === -1) res.status(404).json({ error: "Server not found" });
+    if (idx === -1) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
     db.servers[idx] = { ...db.servers[idx], ...req.body };
     saveDB(db);
     const { password: _, privateKey: __, ...sanitized } = db.servers[idx];
@@ -183,11 +200,18 @@ async function startServer() {
   app.post("/api/servers/:id/upload", upload.single("file"), (req: any, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
-    if (!req.file) res.status(400).json({ error: "No file uploaded" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
+    if (!req.file) {
+      res.status(400).json({ error: "No file uploaded" });
+      return;
+    }
 
     if (!req.file.path.startsWith("/tmp/")) {
       res.status(400).json({ error: "Invalid local file path" });
+      return;
     }
 
     const safeOriginalName = path.basename(req.file.originalname);
@@ -199,6 +223,7 @@ async function startServer() {
       res.status(400).json({
         error: "Remote path must be within /tmp/ or /home/<username>/",
       });
+      return;
     }
 
     const conn = new Client();
@@ -208,6 +233,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
 
           const safeLocalPath = path.join("/tmp", path.basename(req.file.path));
@@ -222,6 +248,7 @@ async function startServer() {
             conn.end();
             fs.unlinkSync(safeLocalPath);
             res.status(500).json({ error: err.message });
+            return;
           });
           readStream.pipe(writeStream);
           return;
@@ -229,6 +256,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -236,7 +264,10 @@ async function startServer() {
   app.post("/api/servers/:id/destroy", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const conn = new Client();
     conn
@@ -246,6 +277,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
 
           // Send password first
@@ -270,17 +302,32 @@ async function startServer() {
 
           let output = "";
           stream.on("data", (data: Buffer) => (output += data.toString()));
-          stream.on("close", () => {
+          stream.on("close", (code: number) => {
             conn.end();
+            const log = shellSanitize(output, server.password);
+            // A rejected sudo password leaves the host untouched, so reporting
+            // success here would drop the host from the fleet for nothing.
+            const sudoFailed = /SUDO_PROMPT|Sorry, try again|incorrect password/i.test(output);
+            if (sudoFailed || code !== 0) {
+              res.json({
+                success: false,
+                error: sudoFailed
+                  ? "sudo rejected the stored password; nothing was removed."
+                  : `Cleanup exited with code ${code}.`,
+                log,
+              });
+              return;
+            }
             const dbAfter = getDB();
             dbAfter.servers = dbAfter.servers.filter((s: any) => s.id !== req.params.id);
             saveDB(dbAfter);
-            res.json({ success: true, log: shellSanitize(output, server.password) });
+            res.json({ success: true, log });
           });
         });
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -288,11 +335,15 @@ async function startServer() {
   app.post("/api/servers/:id/exec", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const { command } = req.body;
     if (!command || typeof command !== "string") {
       res.status(400).json({ error: "Missing or invalid command" });
+      return;
     }
 
     let safeCommand = "";
@@ -308,6 +359,7 @@ async function startServer() {
         error: "Command not permitted. Use one of the allowed commands.",
         allowed: [...ALLOWED_EXEC_COMMANDS],
       });
+      return;
     }
 
     const conn = new Client();
@@ -319,6 +371,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
           stream.write(safeCommand + "\n");
           stream.end();
@@ -333,6 +386,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -340,15 +394,20 @@ async function startServer() {
   app.post("/api/servers/:id/deploy-dockerfile", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const { dockerfile, containerName, portMapping } = req.body;
     if (!dockerfile || !containerName) {
       res.status(400).json({ error: "Missing parameters" });
+      return;
     }
 
     if (typeof containerName !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(containerName)) {
       res.status(400).json({ error: "Invalid container name. Only lowercase alphanumeric, hyphens, and underscores allowed." });
+      return;
     }
     const safeContainerName = containerName;
 
@@ -356,15 +415,9 @@ async function startServer() {
     if (portMapping) {
       if (typeof portMapping !== 'string' || !/^\d{1,5}:\d{1,5}$/.test(portMapping.trim())) {
         res.status(400).json({ error: "Invalid port mapping format. Use HOST:CONTAINER (e.g. 8080:80)" });
+        return;
       }
       safePortFlag = `-p ${portMapping.trim()}`;
-    }
-
-    const localTmpPath = path.join(os.tmpdir(), `kubecast-dockerfile-${Date.now()}`);
-    try {
-      fs.writeFileSync(localTmpPath, dockerfile);
-    } catch (e: any) {
-      res.status(500).json({ error: "Failed to write temp Dockerfile: " + e.message });
     }
 
     const workDir = `/tmp/kubecast-deploy-${safeContainerName}-${Date.now()}`;
@@ -375,6 +428,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
 
           const remoteDockerfile = `${workDir}/Dockerfile`;
@@ -385,8 +439,8 @@ async function startServer() {
           stream.on("close", (code: number) => {
             if (code !== 0) {
               conn.end();
-              if (fs.existsSync(localTmpPath)) fs.unlinkSync(localTmpPath);
               res.status(500).json({ error: `Setup failed with code ${code}` });
+              return;
             }
 
             const buildAndRun = [
@@ -399,8 +453,8 @@ async function startServer() {
             conn.exec("sudo -S -p '' bash -s", (execErr, execStream) => {
               if (execErr) {
                 conn.end();
-                if (fs.existsSync(localTmpPath)) fs.unlinkSync(localTmpPath);
-                res.status(500).json({ error: execErr.message });
+                  res.status(500).json({ error: execErr.message });
+                return;
               }
               execStream.write(server.password + "\n");
               execStream.write(buildAndRun + "\n");
@@ -416,8 +470,7 @@ async function startServer() {
               });
               execStream.on("close", (exitCode: number) => {
                 conn.end();
-                if (fs.existsSync(localTmpPath)) fs.unlinkSync(localTmpPath);
-                res.json({ 
+                  res.json({ 
                   code: exitCode, 
                   output: shellSanitize(output, server.password), 
                   error: shellSanitize(errorStr, server.password) 
@@ -428,8 +481,8 @@ async function startServer() {
         });
       })
       .on("error", (err: any) => {
-        if (fs.existsSync(localTmpPath)) fs.unlinkSync(localTmpPath);
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -437,11 +490,15 @@ async function startServer() {
   app.post("/api/servers/:id/stop-container", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const { containerName } = req.body;
     if (typeof containerName !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(containerName)) {
       res.status(400).json({ error: "Invalid container name" });
+      return;
     }
     const safeContainerName = containerName;
 
@@ -452,6 +509,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
           stream.write(server.password + "\n");
           stream.write(`docker rm -f ${safeContainerName}\n`);
@@ -473,6 +531,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -480,7 +539,10 @@ async function startServer() {
   app.get("/api/servers/:id/stats", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const conn = new Client();
     conn
@@ -490,6 +552,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
           let output = "";
           stream.on("data", (data: Buffer) => (output += data.toString()));
@@ -510,6 +573,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Stats failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -517,7 +581,10 @@ async function startServer() {
   app.get("/api/servers/:id/containers", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const conn = new Client();
     conn
@@ -528,6 +595,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
           let output = "";
           stream.on("data", (data: Buffer) => (output += data.toString()));
@@ -547,6 +615,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -554,11 +623,15 @@ async function startServer() {
   app.delete("/api/servers/:id/containers/:name", (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const containerName = req.params.name;
     if (!/^[a-z0-9_-]{1,64}$/.test(containerName)) {
       res.status(400).json({ error: "Invalid container name" });
+      return;
     }
 
     const conn = new Client();
@@ -568,6 +641,7 @@ async function startServer() {
           if (err) {
             conn.end();
             res.status(500).json({ error: err.message });
+            return;
           }
           stream.write(server.password + "\n");
           stream.write(`docker rm -f ${containerName}\n`);
@@ -589,6 +663,7 @@ async function startServer() {
       })
       .on("error", (err: any) => {
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
@@ -596,7 +671,10 @@ async function startServer() {
   app.post("/api/clusters/:id/deploy-sample", async (req: Request, res: Response) => {
     const db = getDB();
     const cluster = db.clusters.find((c: any) => c.id === req.params.id);
-    if (!cluster) res.status(404).json({ error: "Cluster not found" });
+    if (!cluster) {
+      res.status(404).json({ error: "Cluster not found" });
+      return;
+    }
     const results: any[] = [];
     for (const serverId of cluster.serverIds) {
       const server = db.servers.find((s: any) => s.id === serverId);
@@ -638,7 +716,10 @@ async function startServer() {
   app.post("/api/clusters/:id/simulate-load", async (req: Request, res: Response) => {
     const db = getDB();
     const cluster = db.clusters.find((c: any) => c.id === req.params.id);
-    if (!cluster) res.status(404).json({ error: "Cluster not found" });
+    if (!cluster) {
+      res.status(404).json({ error: "Cluster not found" });
+      return;
+    }
     const results: any[] = [];
     for (const serverId of cluster.serverIds) {
       const server = db.servers.find((s: any) => s.id === serverId);
@@ -681,12 +762,18 @@ async function startServer() {
   app.get("/api/clusters/:id", (req: Request, res: Response) => {
     const db = getDB();
     const cluster = db.clusters.find((c: any) => c.id === req.params.id);
-    if (!cluster) res.status(404).json({ error: "Cluster not found" });
+    if (!cluster) {
+      res.status(404).json({ error: "Cluster not found" });
+      return;
+    }
     res.json(cluster);
   });
   app.post("/api/clusters", (req: Request, res: Response) => {
     const { name, serverIds } = req.body;
-    if (!name) res.status(400).json({ error: "name is required" });
+    if (!name) {
+      res.status(400).json({ error: "name is required" });
+      return;
+    }
     const db = getDB();
     const newCluster = {
       id: crypto.randomUUID(),
@@ -700,7 +787,10 @@ async function startServer() {
   app.put("/api/clusters/:id", (req: Request, res: Response) => {
     const db = getDB();
     const idx = db.clusters.findIndex((c: any) => c.id === req.params.id);
-    if (idx === -1) res.status(404).json({ error: "Cluster not found" });
+    if (idx === -1) {
+      res.status(404).json({ error: "Cluster not found" });
+      return;
+    }
     db.clusters[idx] = { ...db.clusters[idx], ...req.body };
     saveDB(db);
     res.json(db.clusters[idx]);
@@ -715,9 +805,25 @@ async function startServer() {
   app.get("/api/servers/:id/telemetry", async (req: Request, res: Response) => {
     const db = getDB();
     const server = db.servers.find((s: any) => s.id === req.params.id);
-    if (!server) res.status(404).json({ error: "Server not found" });
+    if (!server) {
+      res.status(404).json({ error: "Server not found" });
+      return;
+    }
 
     const conn = new Client();
+
+    // A failed poll is the only signal we get that a host went away, so it has
+    // to flip the stored status back — otherwise a host that dies stays
+    // "online" in the UI forever.
+    const markOffline = () => {
+      const freshDb = getDB();
+      const srv = freshDb.servers.find((s: any) => s.id === req.params.id);
+      if (srv && srv.status !== "offline") {
+        srv.status = "offline";
+        saveDB(freshDb);
+      }
+    };
+
     conn
       .on("ready", () => {
         const cmd = `
@@ -743,7 +849,9 @@ async function startServer() {
         conn.exec(cmd, (err, stream) => {
           if (err) {
             conn.end();
+            markOffline();
             res.status(500).json({ error: err.message });
+            return;
           }
           let output = "";
           stream.on("data", (data: Buffer) => (output += data.toString()));
@@ -773,13 +881,18 @@ async function startServer() {
         });
       })
       .on("error", (err: any) => {
+        markOffline();
         res.status(500).json({ error: "Connection failed: " + err.message });
+        return;
       })
       .connect(getServerSSHConfig(server));
   });
 
-  const httpServer = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  // Loopback by default: this process holds root SSH credentials for every
+  // managed host, so it must not be reachable from the network unless asked.
+  const HOST = process.env.HOST || "127.0.0.1";
+  const httpServer = app.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
   });
 
   const wss = new WebSocketServer({ server: httpServer, path: "/ws/ssh" });
@@ -787,13 +900,19 @@ async function startServer() {
   const wsConnectionCount = new Map<string, number>();
   const WS_MAX_CONNECTIONS_PER_IP = 10;
   const WS_RATE_WINDOW_MS = 60_000;
-  const wsRateTracker = new Map<string, { count: number; resetAt: number }>();
+  // Keystrokes and control frames need very different ceilings: a human typing
+  // bursts well past 200 frames a minute, while connect/deploy must stay rare.
+  const WS_CONTROL_LIMIT = 200;
+  const WS_INPUT_LIMIT = 3000;
+  const wsRateTracker = new Map<string, { control: number; input: number; resetAt: number }>();
 
   wss.on("connection", (ws, req) => {
     const origin = req.headers.origin;
-    if (origin && process.env.NODE_ENV === "production") {
+    if (process.env.NODE_ENV === "production") {
+      // A browser always sends Origin. Rejecting its absence keeps non-browser
+      // clients from opening a shell without going through the UI.
       const host = req.headers.host;
-      if (origin !== `http://${host}` && origin !== `https://${host}`) {
+      if (!origin || (origin !== `http://${host}` && origin !== `https://${host}`)) {
         ws.close(1008, "Origin not allowed");
         return;
       }
@@ -807,23 +926,29 @@ async function startServer() {
     }
     wsConnectionCount.set(ip, currentConns + 1);
     ws.on("close", () => {
-      wsConnectionCount.set(ip, Math.max(0, (wsConnectionCount.get(ip) ?? 1) - 1));
+      const remaining = Math.max(0, (wsConnectionCount.get(ip) ?? 1) - 1);
+      if (remaining === 0) {
+        wsConnectionCount.delete(ip);
+        wsRateTracker.delete(ip);
+      } else {
+        wsConnectionCount.set(ip, remaining);
+      }
     });
 
-    function checkMessageRate(): boolean {
+    function checkMessageRate(kind: "control" | "input"): boolean {
       const now = Date.now();
-      const tracker = wsRateTracker.get(ip);
+      let tracker = wsRateTracker.get(ip);
       if (!tracker || now > tracker.resetAt) {
-        wsRateTracker.set(ip, { count: 1, resetAt: now + WS_RATE_WINDOW_MS });
-        return true;
+        tracker = { control: 0, input: 0, resetAt: now + WS_RATE_WINDOW_MS };
+        wsRateTracker.set(ip, tracker);
       }
-      tracker.count++;
-      if (tracker.count > 200) return false;
-      return true;
+      tracker[kind] += 1;
+      return tracker[kind] <= (kind === "input" ? WS_INPUT_LIMIT : WS_CONTROL_LIMIT);
     }
 
     let sshClient: Client | null = null;
     let connectedServerId: string | null = null;
+    let shellStream: { write: (data: string) => void } | null = null;
 
     const provisionSnippets = {
       ensureCurl: [
@@ -855,15 +980,24 @@ async function startServer() {
     } as const;
 
     ws.on("message", async (message: string) => {
-      if (!checkMessageRate()) {
-        ws.send(JSON.stringify({ type: "error", data: "Rate limit exceeded. Slow down." }));
-        return;
-      }
-
       let data;
       try {
         data = JSON.parse(message.toString());
       } catch (e) {
+        return;
+      }
+
+      if (!checkMessageRate(data?.type === "input" ? "input" : "control")) {
+        ws.send(JSON.stringify({ type: "error", data: "Rate limit exceeded. Slow down." }));
+        return;
+      }
+
+      if (data.type === "input") {
+        if (!shellStream) {
+          ws.send(JSON.stringify({ type: "error", data: "No active shell. Open a terminal first." }));
+          return;
+        }
+        shellStream.write(data.data);
         return;
       }
 
@@ -876,6 +1010,9 @@ async function startServer() {
           return;
         }
 
+        // A reconnect on the same socket must not leave the old session open.
+        shellStream = null;
+        sshClient?.end();
         connectedServerId = server.id;
         sshClient = new Client();
         sshClient
@@ -887,7 +1024,6 @@ async function startServer() {
               saveDB(currentDb);
             }
 
-            ws.send(JSON.stringify({ type: "status", data: "Connected" }));
             sshClient?.shell((err, stream) => {
               if (err) {
                 ws.send(JSON.stringify({ type: "error", data: err.message }));
@@ -905,25 +1041,21 @@ async function startServer() {
                 ws.send(JSON.stringify({ type: "data", data: sanitize(chunk.toString()) }));
               });
               stream.on("close", () => {
+                if (shellStream === stream) shellStream = null;
                 ws.send(JSON.stringify({ type: "status", data: "Disconnected" }));
               });
-              ws.on("message", (msg: string) => {
-                let input;
-                try {
-                   input = JSON.parse(msg.toString());
-                } catch (e) {
-                   return;
-                }
-                if (input.type === "input") {
-                  stream.write(input.data);
-                }
-              });
+
+              // Register the stream before announcing the connection: the client
+              // auto-runs commands the moment it sees "Connected".
+              shellStream = stream;
+              ws.send(JSON.stringify({ type: "status", data: "Connected" }));
             });
           })
           .on("error", (err: any) => {
             ws.send(JSON.stringify({ type: "error", data: err.message }));
           })
           .connect(getServerSSHConfig(server));
+        return;
       }
 
       if (data.type === "deploy") {
@@ -947,12 +1079,28 @@ async function startServer() {
             return;
           }
 
-          await deployTemplate({
-            sshClient,
-            ws,
-            sudoPassword: server.password,
-            config: data.templateConfig as TemplateConfig
-          });
+          // Every template step runs through `sudo -S`, so a key-only host has
+          // no password to feed it and would fail silently step by step.
+          if (!server.password) {
+            ws.send(JSON.stringify({
+              type: "error",
+              data: "Template deploys need a stored sudo password; this host uses key authentication.",
+            }));
+            return;
+          }
+
+          try {
+            await deployTemplate({
+              sshClient,
+              ws,
+              sudoPassword: server.password,
+              config: data.templateConfig as TemplateConfig
+            });
+          } catch (err: any) {
+            // deployTemplate can throw before its own error handling (missing
+            // config), and an unhandled rejection here would kill the process.
+            ws.send(JSON.stringify({ type: "error", data: err?.message ?? "Template deploy failed." }));
+          }
           return;
         }
 
@@ -1080,7 +1228,15 @@ async function startServer() {
                 ws.send(JSON.stringify({ type: "data", data: sanitize(text) }));
               });
               stream.on("close", (code: number) => {
-                if (code === 0 && connectedServerId) {
+                if (code !== 0) {
+                  // Without this the user only sees raw output and no verdict.
+                  ws.send(JSON.stringify({
+                    type: "error",
+                    data: `${scriptType} failed with exit code ${code}.`,
+                  }));
+                  return;
+                }
+                if (connectedServerId) {
                   const dbLatest = getDB();
                   const srv = dbLatest.servers.find((s: any) => s.id === connectedServerId);
                   if (srv) {
@@ -1100,12 +1256,18 @@ async function startServer() {
     });
 
     ws.on("close", () => {
+      shellStream = null;
       sshClient?.end();
     });
   });
 
-  const isProd = process.env.NODE_ENV === "production" || 
-                 (typeof process !== 'undefined' && ((process as any).isPackaged || process.versions.electron));
+  // An unknown API path must not fall through to the SPA shell: a 200 with
+  // index.html makes a typo'd endpoint look like a successful call.
+  app.use("/api", (_req: Request, res: Response) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  const isProd = process.env.NODE_ENV === "production";
 
   if (!isProd) {
     const { createServer } = await import("vite");
@@ -1115,12 +1277,9 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // In production, prioritize DIST_PATH from main process, fallback to relative path
-    // If bundled as dist/server.js, __dirname is 'dist', so we need '..' to reach assets if structured differently,
-    // but usually in Electron assets are next to the script or in a specific resources folder.
-    const distPath = process.env.DIST_PATH || 
-                    (process.resourcesPath ? path.join(process.resourcesPath, "app.asar", "dist") : path.join(__dirname, "..", "dist"));
-    
+    // Bundled output lives at dist/server.js, so the static root is its sibling.
+    const distPath = process.env.DIST_PATH || path.join(__dirname, "..", "dist");
+
     console.log(`[Production] Serving static files from: ${distPath}`);
     
     if (!fs.existsSync(distPath)) {
