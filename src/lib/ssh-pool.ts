@@ -1,4 +1,3 @@
-import { createHash } from "crypto";
 import { Client } from "ssh2";
 import type { ClientChannel, ConnectConfig } from "ssh2";
 
@@ -12,7 +11,7 @@ import type { ClientChannel, ConnectConfig } from "ssh2";
  *
  * Design notes:
  *  - One connection per host, keyed by server id. The connection parameters are
- *    fingerprinted, so editing a host's password/key/host/port transparently
+ *    compared verbatim, so editing a host's password/key/host/port transparently
  *    replaces the cached connection instead of reusing stale credentials.
  *  - Concurrent execs per connection are capped (SSH channels are cheap but not
  *    free, and a burst of polls must not starve the host's sshd).
@@ -90,7 +89,8 @@ interface Waiter {
 
 interface PoolEntry {
   key: string;
-  fingerprint: string;
+  /** The exact connection parameters this connection was opened with. */
+  credentials: string;
   client: Client;
   /** Resolves once the handshake and auth have completed. */
   ready: Promise<Client>;
@@ -116,18 +116,23 @@ function keyFor(server: PoolServer): string {
 }
 
 /**
- * Identifies the credentials/endpoint a connection was opened with. Hashing
- * keeps a second copy of the password out of memory.
+ * The credentials and endpoint a connection was opened with, as one comparable
+ * string.
+ *
+ * This is a change-detection key, not a password hash: it is never persisted,
+ * never transmitted, and never compared against a stored credential. Hashing it
+ * would only invite the reading that it protects the secret, so the material is
+ * kept as-is and compared verbatim. The password is already held in plaintext
+ * by the caller's config and by `ssh2` itself, so this adds no new exposure.
  */
-function fingerprintFor(server: PoolServer): string {
-  const material = [
+function credentialMaterialFor(server: PoolServer): string {
+  return [
     server.host,
     String(server.port ?? 22),
     server.username,
     server.password ?? "",
     server.privateKey ?? "",
   ].join("\u0000");
-  return createHash("sha256").update(material).digest("hex").slice(0, 16);
 }
 
 function connectConfig(server: PoolServer): ConnectConfig {
@@ -188,11 +193,11 @@ function scheduleIdleClose(entry: PoolEntry): void {
   unref(entry.idleTimer);
 }
 
-function createEntry(key: string, fingerprint: string, server: PoolServer): PoolEntry {
+function createEntry(key: string, credentials: string, server: PoolServer): PoolEntry {
   const client = new Client();
   const entry: PoolEntry = {
     key,
-    fingerprint,
+    credentials,
     client,
     ready: Promise.resolve(client),
     active: 0,
@@ -266,11 +271,11 @@ function createEntry(key: string, fingerprint: string, server: PoolServer): Pool
 
 function getEntry(server: PoolServer): PoolEntry {
   const key = keyFor(server);
-  const fingerprint = fingerprintFor(server);
+  const credentials = credentialMaterialFor(server);
   const existing = entries.get(key);
 
   if (existing) {
-    if (!existing.dead && existing.fingerprint === fingerprint) {
+    if (!existing.dead && existing.credentials === credentials) {
       if (existing.idleTimer) {
         clearTimeout(existing.idleTimer);
         existing.idleTimer = null;
@@ -281,7 +286,7 @@ function getEntry(server: PoolServer): PoolEntry {
     evict(existing, new SshPoolError("closed", "SSH connection replaced"));
   }
 
-  const entry = createEntry(key, fingerprint, server);
+  const entry = createEntry(key, credentials, server);
   entries.set(key, entry);
   return entry;
 }

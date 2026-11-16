@@ -27,6 +27,17 @@ const limiter = rateLimit({
   legacyHeaders: false,
 });
 
+// The SPA fallback is the only non-API route that runs application code, so it
+// gets its own budget. Static assets are deliberately left unlimited: a single
+// page load legitimately fetches dozens of them, and they are immutable files
+// served straight off disk.
+const pageLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120, // a page load costs one; this only stops a loop
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "db.json");
 
@@ -1461,7 +1472,7 @@ async function startServer() {
       }
     }));
 
-    app.get("*", (_req: Request, res: Response) => {
+    app.get("*", pageLimiter, (_req: Request, res: Response) => {
       const indexPath = path.join(distPath, "index.html");
       if (fs.existsSync(indexPath)) {
         res.sendFile(indexPath);
