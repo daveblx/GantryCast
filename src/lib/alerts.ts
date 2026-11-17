@@ -24,7 +24,7 @@ export type Thresholds = Record<ThresholdMetric, ThresholdPair>;
 export type ThresholdMap = Record<string, Thresholds>;
 
 /** Single localStorage key holding the whole map, as JSON. */
-export const ALERT_THRESHOLDS_KEY = 'kubecast:alert-thresholds';
+export const ALERT_THRESHOLDS_KEY = 'gantrycast:alert-thresholds';
 
 export const DEFAULT_THRESHOLDS: Thresholds = {
   cpu: { warn: 75, critical: 90 },

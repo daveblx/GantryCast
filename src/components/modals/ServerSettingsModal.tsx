@@ -58,14 +58,6 @@ export function ServerSettingsModal({
             </Badge>
           }
         />
-        <KV
-          k="K8s runtime"
-          v={
-            <Badge tone={server.installed?.k8s ? 'ok' : 'muted'}>
-              {server.installed?.k8s ? 'Active' : 'Not a node'}
-            </Badge>
-          }
-        />
         <KV k="Host" v={server.host} />
         <KV k="User" v={server.username} />
         <KV k="Port" v={server.port} />
@@ -95,7 +87,7 @@ export function ServerSettingsModal({
             title={
               maintenanceMode
                 ? 'Unavailable while maintenance mode is on'
-                : 'Install curl, Docker and Kubernetes'
+                : 'Install curl and Docker'
             }
           >
             <Play size={12} strokeWidth={1.75} />

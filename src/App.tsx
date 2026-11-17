@@ -46,8 +46,8 @@ const VIEW_TITLE: Record<ViewId, string> = {
 const ANALYZE_LOGS_COMMAND =
   "sudo sh -lc 'du -h -d2 /var/log 2>/dev/null | sort -h | tail -n 30'";
 
-const AUTO_SYNC_KEY = 'kubecast:auto-sync';
-const DEFAULT_PORT_KEY = 'kubecast:default-port';
+const AUTO_SYNC_KEY = 'gantrycast:auto-sync';
+const DEFAULT_PORT_KEY = 'gantrycast:default-port';
 
 /** Per-host poll bookkeeping: consecutive failures and the next attempt time. */
 interface HostPollState {
@@ -465,7 +465,7 @@ export default function App() {
 
       <div className="main">
         <header className="toolbar">
-          <span className="toolbar__crumb">kubecast</span>
+          <span className="toolbar__crumb">gantrycast</span>
           <span className="faint">/</span>
           <span className="toolbar__title">{VIEW_TITLE[view]}</span>
 

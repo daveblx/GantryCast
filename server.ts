@@ -70,14 +70,7 @@ const ALLOWED_EXEC_COMMANDS = new Set([
   "docker ps -a",
   "docker images",
   "docker stats --no-stream",
-  "kubectl get nodes",
-  "kubectl get pods",
-  "kubectl get pods -A",
-  "kubectl get services",
-  "k3s kubectl get nodes",
-  "k3s kubectl get pods",
   "systemctl status docker",
-  "systemctl status k3s",
   // The Prod Test probe on the host card. Shared with the renderer so the two
   // copies cannot drift apart and start returning 403.
   PROD_TEST_COMMAND,
@@ -125,7 +118,7 @@ function shellSanitize(text: string, password?: string): string {
 //
 // The CPU sample sleeps 200ms between the two /proc/stat reads: long enough for
 // the delta to be meaningful, short enough to sit comfortably inside the 8s
-// request budget next to df, docker --version and k3s --version.
+// request budget next to df and docker --version.
 const TELEMETRY_SCRIPT = `
 # A non-C locale makes awk print "75,0" and df print localised units, which the
 # parser and the frontend both read as numbers.
@@ -214,7 +207,6 @@ echo "os: $os_name"
 echo "kernel: $(uname -r 2>/dev/null || echo unknown)"
 
 echo "docker: $(docker --version 2>/dev/null || echo 'none')"
-echo "k3s: $(k3s --version 2>/dev/null || echo 'none')"
 `;
 
 /** Parse the "key: value" lines the telemetry script prints. */
@@ -267,7 +259,7 @@ async function startServer() {
       password: password || "",
       privateKey: privateKey || "",
       status: "offline",
-      installed: { docker: false, k8s: false },
+      installed: { docker: false },
     };
     db.servers.push(newServer);
     saveDB(db);
@@ -415,13 +407,11 @@ async function startServer() {
           // Then send the cleanup commands
           const destroyCmd = [
             'echo "Initiating nuclear cleanup..."',
-            "/usr/local/bin/k3s-uninstall.sh 2>/dev/null || true",
-            "/usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null || true",
             "docker stop $(docker ps -aq) 2>/dev/null || true",
             "docker rm $(docker ps -aq) 2>/dev/null || true",
             "docker system prune -af --volumes 2>/dev/null || true",
             "apt-get purge -y docker-engine docker docker.io docker-ce docker-ce-cli containerd containerd.io 2>/dev/null || yum remove -y docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine 2>/dev/null || true",
-            "rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock /var/lib/rancher /etc/rancher ~/.kube 2>/dev/null || true",
+            "rm -rf /var/lib/docker /etc/docker /var/lib/containerd /var/run/docker.sock 2>/dev/null || true",
             'echo "Cleanup complete. System is clean."',
             "exit"
           ].join("\n");
@@ -549,7 +539,7 @@ async function startServer() {
       safePortFlag = `-p ${portMapping.trim()}`;
     }
 
-    const workDir = `/tmp/kubecast-deploy-${safeContainerName}-${Date.now()}`;
+    const workDir = `/tmp/gantrycast-deploy-${safeContainerName}-${Date.now()}`;
     const conn = new Client();
     conn
       .on("ready", () => {
@@ -968,17 +958,15 @@ async function startServer() {
     const srv = freshDb.servers.find((s: any) => s.id === server.id);
     if (srv) {
       const dockerInstalled = !!(stats.docker && stats.docker !== "none");
-      const k8sInstalled = !!(stats.k3s && stats.k3s !== "none");
-      const installed = srv.installed ?? { docker: false, k8s: false };
+      const installed = srv.installed ?? { docker: false };
       // Only touch the file when something actually changed: this runs on every
       // poll of every host.
-      if (
-        srv.status !== "online" ||
-        installed.docker !== dockerInstalled ||
-        installed.k8s !== k8sInstalled
-      ) {
+      if (srv.status !== "online" || installed.docker !== dockerInstalled) {
         srv.status = "online";
-        srv.installed = { ...installed, docker: dockerInstalled, k8s: k8sInstalled };
+        // Rebuilt rather than spread: a db.json written before the Kubernetes
+        // removal still carries an `installed.k8s` key, and spreading would
+        // keep it alive forever.
+        srv.installed = { docker: dockerInstalled };
         saveDB(freshDb);
       }
     }
@@ -1242,7 +1230,7 @@ async function startServer() {
         }
 
         const { scriptType } = data;
-        const ALLOWED_SCRIPT_TYPES = new Set(["docker", "k3s", "verify", "full", "template"]);
+        const ALLOWED_SCRIPT_TYPES = new Set(["docker", "verify", "full", "template"]);
         if (!ALLOWED_SCRIPT_TYPES.has(scriptType)) {
           ws.send(JSON.stringify({ type: "error", data: "Unknown script type." }));
           return;
@@ -1291,58 +1279,40 @@ async function startServer() {
             'if command -v docker > /dev/null 2>&1; then echo \"  -> Docker already installed: $(docker --version)\"; else curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sudo sh /tmp/get-docker.sh && sudo usermod -aG docker $USER && rm -f /tmp/get-docker.sh && echo \"  -> Docker installed successfully\"; fi',
             'echo \"[3/3] Done.\"',
           ].join(" && ");
-        } else if (scriptType === "k3s") {
-          command = [
-            "set -e",
-            'echo \"[1/2] Ensuring curl...\"',
-            provisionSnippets.ensureCurl,
-            'echo \"[2/2] Installing K3s...\"',
-            'if command -v k3s > /dev/null 2>&1; then echo \"  -> K3s already installed: $(k3s --version 2>&1 | head -1)\"; else curl -sfL https://get.k3s.io | sh - && echo \"  -> K3s installed successfully\"; fi',
-          ].join(" && ");
         } else if (scriptType === "verify") {
           command = [
             "set -e",
             'echo \"===========================================\"',
-            'echo \"        KubeCast Stack Verification\"',
+            'echo \"        GantryCast Stack Verification\"',
             'echo \"===========================================\"',
             'echo \"\"',
-            'echo \"[1/4] Docker binary...\"',
+            'echo \"[1/2] Docker binary...\"',
             'if command -v docker >/dev/null 2>&1; then echo \"  -> $(docker --version)\"; else echo \"  -> MISSING\"; fi',
             'echo \"\"',
-            'echo \"[2/4] Docker service...\"',
+            'echo \"[2/2] Docker service...\"',
             'if command -v systemctl >/dev/null 2>&1; then echo \"  -> $(sudo systemctl is-active docker 2>/dev/null || echo not-running)\"; else echo \"  -> (no systemctl)\"; fi',
-            'echo \"\"',
-            'echo \"[3/4] K3s service...\"',
-            'if command -v systemctl >/dev/null 2>&1; then echo \"  -> $(sudo systemctl is-active k3s 2>/dev/null || echo not-running)\"; else echo \"  -> (no systemctl)\"; fi',
-            'echo \"\"',
-            'echo \"[4/4] Kubernetes API...\"',
-            'if command -v k3s >/dev/null 2>&1; then sudo k3s kubectl get nodes -o wide || true; else echo \"  -> k3s not installed\"; fi',
             'echo \"\"',
             'echo \"=== VERIFY COMPLETE ===\"',
           ].join(" && ");
         } else if (scriptType === "full") {
           command = [
             'echo \"==========================================\"',
-            'echo \"   KubeCast Full Stack Deployment\"',
+            'echo \"   GantryCast Full Stack Deployment\"',
             'echo \"==========================================\"',
             'echo \"\"',
             "set -e",
-            'echo \"[1/5] Ensuring curl...\"',
+            'echo \"[1/4] Ensuring curl...\"',
             provisionSnippets.ensureCurl,
             'echo \"\"',
-            'echo \"[2/5] Installing prerequisites...\"',
+            'echo \"[2/4] Installing prerequisites...\"',
             provisionSnippets.ensureBasicTools,
             'echo \"\"',
-            'echo \"[3/5] Installing Docker...\"',
+            'echo \"[3/4] Installing Docker...\"',
             'if command -v docker > /dev/null 2>&1; then echo \"  -> Docker already installed: $(docker --version)\"; else curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && sudo sh /tmp/get-docker.sh && sudo usermod -aG docker $USER && rm -f /tmp/get-docker.sh && echo \"  -> Docker installed successfully\"; fi',
             'echo \"\"',
-            'echo \"[4/5] Installing K3s (Lightweight Kubernetes)...\"',
-            'if command -v k3s > /dev/null 2>&1; then echo \"  -> K3s already installed: $(k3s --version 2>&1 | head -1)\"; else curl -sfL https://get.k3s.io | sh - && echo \"  -> K3s installed successfully\"; fi',
-            'echo \"\"',
-            'echo \"[5/5] Verifying services...\"',
+            'echo \"[4/4] Verifying services...\"',
             'echo \"===========================================\"',
             'echo \"  Docker: $(sudo systemctl is-active docker 2>/dev/null || echo not-running)\"',
-            'echo \"  K3s:    $(sudo systemctl is-active k3s 2>/dev/null || echo not-running)\"',
             'echo \"===========================================\"',
             'echo \"\"',
             'echo \"=== DEPLOYMENT COMPLETE ===\"',
@@ -1418,7 +1388,6 @@ async function startServer() {
                   const srv = dbLatest.servers.find((s: any) => s.id === connectedServerId);
                   if (srv) {
                     if (scriptType === "docker" || scriptType === "full") srv.installed.docker = true;
-                    if (scriptType === "k3s" || scriptType === "full") srv.installed.k8s = true;
                     saveDB(dbLatest);
                   }
                   ws.send(JSON.stringify({ type: "status", data: `${scriptType} installed successfully` }));

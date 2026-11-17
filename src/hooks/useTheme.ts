@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Theme } from '../types';
 
-const STORAGE_KEY = 'kubecast.theme';
+const STORAGE_KEY = 'gantrycast.theme';
 
 function readInitial(): Theme {
   if (typeof window === 'undefined') return 'dark';

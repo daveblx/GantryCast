@@ -11,7 +11,6 @@ export const PROD_TEST_COMMAND = [
   'uname -a',
   'echo "Node.js:"; node -v || echo "Not installed"',
   'echo "Docker:"; docker --version || echo "Not installed"',
-  'echo "K3s:"; k3s --version 2>/dev/null || echo "Not installed"',
   'echo "Disk usage:"; df -h / | tail -1',
   'echo "CPU info:"; nproc || echo "nproc not available"',
   'echo "Memory:"; free -h || cat /proc/meminfo | grep Mem',

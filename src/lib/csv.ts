@@ -91,10 +91,10 @@ export function countTelemetryRows(
   return total;
 }
 
-/** `kubecast-telemetry-2024-05-01.csv` */
+/** `gantrycast-telemetry-2024-05-01.csv` */
 export function telemetryCsvFilename(now = new Date()): string {
   const stamp = Number.isNaN(now.getTime()) ? 'export' : now.toISOString().slice(0, 10);
-  return `kubecast-telemetry-${stamp}.csv`;
+  return `gantrycast-telemetry-${stamp}.csv`;
 }
 
 /** Hand a CSV document to the browser as a file download. */

@@ -9,7 +9,6 @@ export interface Server {
   status: 'online' | 'offline' | 'error';
   installed: {
     docker: boolean;
-    k8s: boolean;
   };
   telemetry?: Telemetry;
 }
@@ -49,7 +48,6 @@ export interface Telemetry {
   /** Kernel release, e.g. "6.8.0-45-generic". */
   kernel?: string;
   docker?: string;
-  k3s?: string;
   error?: string;
 }
 
@@ -121,7 +119,7 @@ export type AutoRun =
       templateConfig?: unknown;
     };
 
-export type DeployScriptType = 'docker' | 'k3s' | 'full' | 'verify';
+export type DeployScriptType = 'docker' | 'full' | 'verify';
 
 export interface ExecResult {
   code: number;

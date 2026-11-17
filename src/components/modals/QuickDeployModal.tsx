@@ -2,7 +2,7 @@ import { useId } from 'react';
 import type { Server } from '../../types';
 import { Button, Field, KV, Modal, Section, Select } from '../ui';
 
-const STEPS = ['Install curl', 'Install Docker', 'Install Kubernetes (k3s)'];
+const STEPS = ['Install curl', 'Install Docker'];
 
 export function QuickDeployModal({
   servers,
@@ -23,7 +23,7 @@ export function QuickDeployModal({
   return (
     <Modal
       title="Quick deploy"
-      subtitle="Connect over SSH, then install curl, Docker and Kubernetes."
+      subtitle="Connect over SSH, then install curl and Docker."
       onClose={onClose}
       footer={
         <>

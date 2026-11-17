@@ -67,7 +67,7 @@ jobs:
       - name: Package web bundle
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          ARCHIVE="kubecast-${VERSION}-web.tar.gz"
+          ARCHIVE="gantrycast-${VERSION}-web.tar.gz"
           tar -czf "${ARCHIVE}" dist package.json package-lock.json
           echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
           ls -la "${ARCHIVE}"

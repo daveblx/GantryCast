@@ -1,8 +1,8 @@
-# KubeCast
+# GantryCast
 
-KubeCast is a self-hosted web control plane for a fleet of Linux servers running
-Docker and Kubernetes. It connects to hosts over SSH, so nothing has to be installed
-on the target machines beyond the container runtimes themselves.
+GantryCast is a self-hosted web control plane for a fleet of Linux servers running
+Docker. It connects to hosts over SSH, so nothing has to be installed on the target
+machines beyond the container runtime itself.
 
 
 ![Dashboard](screenshots/control_plane.png)

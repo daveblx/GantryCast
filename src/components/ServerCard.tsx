@@ -43,7 +43,6 @@ const PROD_CHECKS: ProdCheck[] = [
   { label: 'Kernel', key: 'uname', match: /^Linux|^Darwin/ },
   { label: 'Node.js', key: 'Node.js', match: /^Node\.js:/ },
   { label: 'Docker', key: 'Docker', match: /^Docker:/ },
-  { label: 'K3s', key: 'K3s', match: /^K3s:/ },
   { label: 'Disk usage', key: 'Disk usage', match: /^Disk usage:/ },
   { label: 'CPU info', key: 'CPU info', match: /^CPU info:/ },
   { label: 'Memory', key: 'Memory', match: /^Memory:/ },
@@ -159,8 +158,6 @@ export function ServerCard({
   // A telemetry payload that omits the field must not read as "Absent".
   const dockerInstalled =
     telemetry?.docker !== undefined ? telemetry.docker !== 'none' : !!server.installed?.docker;
-  const k8sActive =
-    telemetry?.k3s !== undefined ? telemetry.k3s !== 'none' : !!server.installed?.k8s;
 
   const netSeries = history.some((sample) => typeof sample.txRate === 'number')
     ? series(history, 'txRate')
@@ -242,10 +239,6 @@ export function ServerCard({
                 {dockerInstalled ? 'Installed' : 'Absent'}
               </Badge>
             }
-          />
-          <KV
-            k="K8s runtime"
-            v={<Badge tone={k8sActive ? 'ok' : 'muted'}>{k8sActive ? 'Active' : 'Not a node'}</Badge>}
           />
           {alert.hasData && (
             <KV

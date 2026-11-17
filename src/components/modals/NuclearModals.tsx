@@ -31,8 +31,8 @@ export function NuclearWarningModal({
       }
     >
       <Banner tone="warn" icon={<AlertTriangle size={12} strokeWidth={1.75} />}>
-        This uninstalls Docker, K3s and every cluster component on the host. Containers, volumes and
-        cluster state are removed with them.
+        This uninstalls Docker and every container on the host. Containers and volumes are removed
+        with them.
       </Banner>
 
       <div className="col gap-1">
@@ -43,14 +43,6 @@ export function NuclearWarningModal({
           v={
             <Badge tone={server.installed?.docker ? 'ok' : 'muted'}>
               {server.installed?.docker ? 'Installed' : 'Absent'}
-            </Badge>
-          }
-        />
-        <KV
-          k="K8s runtime"
-          v={
-            <Badge tone={server.installed?.k8s ? 'ok' : 'muted'}>
-              {server.installed?.k8s ? 'Active' : 'Not a node'}
             </Badge>
           }
         />
@@ -96,7 +88,7 @@ export function NuclearConfirmModal({
       }
     >
       <Banner tone="err" icon={<Shield size={12} strokeWidth={1.75} />}>
-        This cannot be undone. The host keeps running, but everything KubeCast installed on it is
+        This cannot be undone. The host keeps running, but everything GantryCast installed on it is
         removed.
       </Banner>
 

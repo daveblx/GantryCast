@@ -12,7 +12,7 @@ import {
 import { useCallback, useEffect, useState } from 'react';
 import type { ViewId } from '../types';
 
-const COLLAPSE_KEY = 'kubecast:sidebar-collapsed';
+const COLLAPSE_KEY = 'gantrycast:sidebar-collapsed';
 
 function readCollapsed(): boolean {
   if (typeof window === 'undefined') return false;
@@ -81,7 +81,7 @@ export function Sidebar({
         <img className="sidebar__mark" src="/logo.png" alt="" />
         <div className="grow sidebar__brand-text">
           <div className="sidebar__name">
-            Kube<em>Cast</em>
+            Gantry<em>Cast</em>
           </div>
           <div className="sidebar__sub">Control plane</div>
         </div>

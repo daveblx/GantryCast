@@ -137,15 +137,13 @@ function initialRect(): Rect {
 
 const DEPLOY_ACTIONS: ReadonlyArray<{ scriptType: DeployScriptType; label: string }> = [
   { scriptType: 'docker', label: 'Install Docker' },
-  { scriptType: 'k3s', label: 'Install K3s' },
   { scriptType: 'full', label: 'Full stack' },
   { scriptType: 'verify', label: 'Verify' },
 ];
 
 const DEPLOY_NOTICES: Record<DeployScriptType, string> = {
   docker: 'Deploy: install Docker',
-  k3s: 'Deploy: install K3s',
-  full: 'Deploy: full stack (curl, docker, k3s)',
+  full: 'Deploy: full stack (curl, docker)',
   verify: 'Deploy: verify stack',
 };
 

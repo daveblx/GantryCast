@@ -41,7 +41,7 @@ test('DEFAULT_THRESHOLDS', async (t) => {
   });
 
   await t.test('should use a single namespaced storage key', () => {
-    assert.strictEqual(ALERT_THRESHOLDS_KEY, 'kubecast:alert-thresholds');
+    assert.strictEqual(ALERT_THRESHOLDS_KEY, 'gantrycast:alert-thresholds');
   });
 });
 

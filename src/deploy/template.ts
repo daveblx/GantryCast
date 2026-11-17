@@ -84,7 +84,7 @@ export async function deployTemplate(params: {
   const execCommand = (cmd: string, stepName: string, stopOnError = true): Promise<boolean> =>
     new Promise((resolve) => {
       log(`Executing: ${stepName}...`);
-      const SUDO_PROMPT = "[kubecast-sudo-prompt]";
+      const SUDO_PROMPT = "[gantrycast-sudo-prompt]";
       // Use bash -s to execute the command safely via stdin
       const shellCmd = `sudo -S -p "${SUDO_PROMPT}" bash -s`;
 

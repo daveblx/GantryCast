@@ -1,8 +1,8 @@
 {
-  "name": "kubecast",
+  "name": "gantrycast",
   "private": true,
   "version": "0.1.0",
-  "description": "KubeCast - Kubernetes Management Dashboard",
+  "description": "GantryCast - Docker Fleet Management Dashboard",
   "author": "David Blachnitzky",
   "type": "module",
   "scripts": {

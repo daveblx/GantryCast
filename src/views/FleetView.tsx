@@ -61,7 +61,6 @@ export function FleetView({
 }) {
   const online = servers.filter((server) => server.status === 'online').length;
   const dockerHosts = servers.filter((server) => server.installed?.docker).length;
-  const k8sNodes = servers.filter((server) => server.installed?.k8s).length;
   const load = useMemo(() => meanLoad(servers, telemetry), [servers, telemetry]);
 
   // Alert thresholds live in localStorage, so the view owns the map and hands
@@ -123,7 +122,7 @@ export function FleetView({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
         <Stat
           label="Active Nodes"
           value={servers.length}
@@ -141,16 +140,6 @@ export function FleetView({
             <>
               <Dot tone={dockerHosts > 0 ? 'ok' : 'idle'} />
               runtime installed
-            </>
-          }
-        />
-        <Stat
-          label="K8s Nodes"
-          value={k8sNodes}
-          foot={
-            <>
-              <Dot tone={k8sNodes > 0 ? 'ok' : 'idle'} />
-              k3s present
             </>
           }
         />
@@ -178,7 +167,7 @@ export function FleetView({
         <EmptyState
           icon={<ServerIcon size={18} strokeWidth={1.75} />}
           title="No hosts connected"
-          text="Add a host over SSH to start collecting telemetry, containers and cluster state."
+          text="Add a host over SSH to start collecting telemetry and containers."
           action={
             <Button variant="primary" onClick={onAddHost}>
               Connect Initial Host

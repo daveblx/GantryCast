@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Renamed the project from KubeCast to GantryCast. The `package.json` name, the
+  page title, the release archive (`gantrycast-<version>-web.tar.gz`), the CSV
+  export filename, the remote deploy temp directory, and the sudo prompt marker
+  all follow. Browser state moves to `gantrycast:` keys, so saved alert
+  thresholds, theme, sidebar state, auto-sync and default port reset once on
+  first load after upgrading.
+
+### Removed
+
+- Kubernetes support. GantryCast installs and reports on Docker only. The `k3s`
+  deploy script, the `kubectl`/`k3s` entries in the `/exec` allowlist, the K3s
+  probe in the Prod Test, the K8s runtime badges, the "K8s Nodes" fleet stat, and
+  the K3s teardown in the destroy endpoint are all gone. The `installed.k8s` and
+  `Telemetry.k3s` fields are dropped; existing `db.json` files keep the stale key
+  and it is ignored.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added
