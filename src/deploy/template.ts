@@ -300,6 +300,129 @@ export async function deployTemplate(params: {
       "Write Traefik dynamic.yml"
     );
 
+    // ── Step 2d: SubMaker app ──────────────────────────────────────────
+    // SubMaker is not part of the cloned template, so its compose file is
+    // written here and registered in the root include list. The profile gate
+    // keeps it out of the deploy unless it was selected.
+    if (config.profiles.includes("submaker")) {
+      status("Adding SubMaker app...");
+      // tls=true (not tls.certresolver) because this file is written after the
+      // resolver-stripping pass, so it must already be in its patched form.
+      const submakerCompose = [
+        "services:",
+        "  submaker:",
+        "    image: xtremexq/submaker:latest",
+        "    container_name: submaker",
+        "    restart: unless-stopped",
+        "    stop_grace_period: 30s",
+        "    expose:",
+        "      - 7001",
+        "    env_file:",
+        "      - .env",
+        "    environment:",
+        "      - STORAGE_TYPE=redis",
+        "      - TRUST_PROXY=1",
+        "      - REDIS_HOST=submaker_redis",
+        "      - REDIS_PORT=6379",
+        "      - REDIS_DB=0",
+        "      - REDIS_KEY_PREFIX=stremio",
+        "      - ENCRYPTION_KEY_FILE=/app/keys/.encryption-key",
+        "      - REDIS_PASSWORD_FILE=/app/keys/.redis-password",
+        "    labels:",
+        '      - "traefik.enable=true"',
+        '      - "traefik.http.routers.submaker.rule=Host(`${SUBMAKER_HOSTNAME?}`)"',
+        '      - "traefik.http.routers.submaker.entrypoints=websecure"',
+        '      - "traefik.http.routers.submaker.tls=true"',
+        '      - "traefik.http.routers.submaker.middlewares=authelia@docker"',
+        '      - "traefik.http.services.submaker.loadbalancer.server.port=7001"',
+        "    volumes:",
+        "      - ${DOCKER_DATA_DIR}/submaker/data:/app/data",
+        "      - ${DOCKER_DATA_DIR}/submaker/cache:/app/.cache",
+        "      - ${DOCKER_DATA_DIR}/submaker/logs:/app/logs",
+        "      - ${DOCKER_DATA_DIR}/submaker/keys:/app/keys",
+        "    depends_on:",
+        "      submaker_redis:",
+        "        condition: service_healthy",
+        "    profiles:",
+        "      - submaker",
+        "      - all",
+        "",
+        "  submaker_redis:",
+        "    image: redis:7-alpine",
+        "    container_name: submaker_redis",
+        "    restart: unless-stopped",
+        "    command: >",
+        "      redis-server",
+        "      --maxmemory 4gb",
+        "      --maxmemory-policy noeviction",
+        "      --appendonly yes",
+        "      --appendfsync everysec",
+        "    volumes:",
+        "      - ${DOCKER_DATA_DIR}/submaker/redis:/data",
+        "    healthcheck:",
+        '      test: ["CMD", "redis-cli", "ping"]',
+        "      interval: 10s",
+        "      timeout: 5s",
+        "      retries: 5",
+        "    profiles:",
+        "      - submaker",
+        "      - all",
+      ].join("\n");
+
+      // Provider keys are set in the SubMaker web UI, so the file only carries
+      // the values the container needs to boot.
+      const submakerEnv = [
+        "OPENSUBTITLES_API_KEY=",
+        "SCS_MANIFEST_TOKEN=",
+        "PORT=7001",
+        "NODE_ENV=production",
+        "LOG_LEVEL=error",
+        "STORAGE_TYPE=redis",
+        "TRUST_PROXY=1",
+        "PUID=1000",
+        "PGID=1000",
+        "TZ=Etc/UTC",
+      ].join("\n");
+
+      // Two registrations: the root include list, and Authelia's Stremio addon
+      // hostname list. Without the second one SubMaker falls through to the
+      // `*.domain` two_factor rule and Stremio can never fetch its manifest.
+      const registerInclude = [
+        "path = '/opt/docker/compose.yaml'",
+        "line = '  - apps/submaker/compose.yaml'",
+        "with open(path) as f: content = f.read()",
+        "if line not in content:",
+        "    content = content.replace('include:' + chr(10), 'include:' + chr(10) + line + chr(10), 1)",
+        "    with open(path, 'w') as f: f.write(content)",
+        "print('SubMaker registered in include list.')",
+        "",
+        "auth = '/opt/docker/apps/authelia/compose.yaml'",
+        "with open(auth) as f: content = f.read()",
+        "if '${SUBMAKER_HOSTNAME}' not in content:",
+        "    anchor = '        ${SYNCRIBULLET_HOSTNAME},'",
+        "    content = content.replace(anchor, anchor + chr(10) + '        ${SUBMAKER_HOSTNAME},', 1)",
+        "    with open(auth, 'w') as f: f.write(content)",
+        "print('SubMaker added to the Stremio addon hostname list.')",
+      ].join("\n");
+
+      const submakerComposeB64 = Buffer.from(submakerCompose).toString("base64");
+      const submakerEnvB64 = Buffer.from(submakerEnv).toString("base64");
+      const registerB64 = Buffer.from(registerInclude).toString("base64");
+
+      await execCommand(
+        [
+          "mkdir -p /opt/docker/apps/submaker",
+          `echo "${submakerComposeB64}" | base64 -d > /opt/docker/apps/submaker/compose.yaml`,
+          `echo "${submakerEnvB64}" | base64 -d > /opt/docker/apps/submaker/.env`,
+          `echo "${registerB64}" | base64 -d > /tmp/register_submaker.py`,
+          "python3 /tmp/register_submaker.py",
+          "rm -f /tmp/register_submaker.py",
+          "chown -R 1000:1000 /opt/docker/apps/submaker",
+        ].join(" && "),
+        "Add SubMaker app"
+      );
+    }
+
     // ── Step 3: Write .env ─────────────────────────────────────────────
     status("Writing root .env...");
     const genSecret = () => randomBytes(32).toString("hex");
@@ -334,6 +457,7 @@ export async function deployTemplate(params: {
       `AUTHELIA_SESSION_SECRET=${sessionSecret}`,
       `AUTHELIA_STORAGE_ENCRYPTION_KEY=${storageKey}`,
       `AUTHELIA_JWT_SECRET=${jwtSecret}`,
+      `AUTHELIA_WEBAUTHN_DISPLAY_NAME=Authelia`,
       `ACTUAL_BUDGET_HOSTNAME=actual-budget.${config.domain}`,
       `ADDON_MANAGER_HOSTNAME=addon-manager.${config.domain}`,
       `ADGUARD_HOSTNAME=adguard.${config.domain}`,
@@ -358,6 +482,7 @@ export async function deployTemplate(params: {
       `CINEBYE_HOSTNAME=cinebye.${config.domain}`,
       `COMET_HOSTNAME=comet.${config.domain}`,
       `DASHDOT_HOSTNAME=dash.${config.domain}`,
+      `DAVEX_HOSTNAME=davex.${config.domain}`,
       `DEBRIDAV_HOSTNAME=debridav.${config.domain}`,
       `DECYPHARR_HOSTNAME=decypharr.${config.domain}`,
       `DISCORD_TICKETS_HOSTNAME=tickets.${config.domain}`,
@@ -366,6 +491,7 @@ export async function deployTemplate(params: {
       `DOZZLE_HOSTNAME=dozzle.${config.domain}`,
       `EASYNEWS_PLUS_HOSTNAME=easynews-plus.${config.domain}`,
       `EASYNEWS_PLUS_PLUS_HOSTNAME=easynews-plus-plus.${config.domain}`,
+      `ERDB_HOSTNAME=erdb.${config.domain}`,
       `FRESHRSS_HOSTNAME=freshrss.${config.domain}`,
       `FIVEFILTERS_FULL_TEXT_RSS_HOSTNAME=fivefilters.${config.domain}`,
       `HOMARR_HOSTNAME=homarr.${config.domain}`,
@@ -420,6 +546,7 @@ export async function deployTemplate(params: {
       `STREMIO_STREAMING_CATALOGS_HOSTNAME=streaming-catalogs.${config.domain}`,
       `STREMIO_TRAKT_ADDON_HOSTNAME=stremio-trakt.${config.domain}`,
       `STREMTHRU_HOSTNAME=stremthru.${config.domain}`,
+      `SUBMAKER_HOSTNAME=submaker.${config.domain}`,
       `SYNCIO_HOSTNAME=syncio.${config.domain}`,
       `SYNCRIBULLET_HOSTNAME=syncribullet.${config.domain}`,
       `TANDOOR_HOSTNAME=tandoor.${config.domain}`,

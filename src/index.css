@@ -1152,6 +1152,23 @@ a:hover {
   background: var(--surface-3);
 }
 
+/* Multi-line checkbox rows: the box aligns with the first line of the label. */
+.check-row--block {
+  align-items: flex-start;
+}
+
+.check-row--block .checkbox {
+  margin-top: 2px;
+}
+
+/* Compose service names under a profile row. */
+.profile-services {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
 /* ── Segmented control ────────────────────────────────────── */
 
 .seg {

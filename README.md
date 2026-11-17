@@ -27,6 +27,9 @@ shell and no native packaging step.
 npm install
 npm run dev
 ```
+## Development Note:
+
+This project was developed using AI-assisted workflows.
 
 ## License
 

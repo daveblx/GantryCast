@@ -152,14 +152,19 @@ export function Checkbox({
   onChange,
   label,
   disabled,
+  className,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: React.ReactNode;
   disabled?: boolean;
+  className?: string;
 }) {
   return (
-    <label className="check-row" style={disabled ? { opacity: 0.55, cursor: 'not-allowed' } : undefined}>
+    <label
+      className={clsx('check-row', className)}
+      style={disabled ? { opacity: 0.55, cursor: 'not-allowed' } : undefined}
+    >
       <input
         type="checkbox"
         className="checkbox"

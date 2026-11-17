@@ -2,7 +2,7 @@ import { useEffect, useId, useState } from 'react';
 import { AlertTriangle, Play, Shield } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { Server } from '../../types';
-import { Banner, Button, Checkbox, Field, Input, Modal, Select } from '../ui';
+import { Banner, Button, Checkbox, Field, Input, Modal, Section, Select } from '../ui';
 
 /* ── Config shape ─────────────────────────────────────────── */
 
@@ -20,13 +20,68 @@ interface TemplateConfig {
   services?: Record<string, Record<string, string>>;
 }
 
-const PROFILE_OPTIONS: ReadonlyArray<{ id: string; label: string; locked?: boolean }> = [
-  { id: 'required', label: 'Required — Traefik and Authelia', locked: true },
-  { id: 'aiostreams', label: 'AIOStreams' },
-  { id: 'vaultwarden', label: 'Vaultwarden' },
-  { id: 'nextcloud', label: 'Nextcloud' },
-  { id: 'plex', label: 'Plex' },
-  { id: 'monitoring', label: 'Monitoring — Prometheus and Grafana' },
+/**
+ * The profiles this deploy can start, with the compose services each one
+ * brings. Profile ids are passed straight through to `COMPOSE_PROFILES`, so
+ * they must match a profile that exists after the template is prepared — a
+ * name nothing defines starts nothing.
+ *
+ * All but `submaker` come from the cloned template
+ * (Viren070/docker-compose-template). `submaker` is written by the deploy
+ * script itself, which also registers it in the root include list.
+ */
+interface ProfileSpec {
+  id: string;
+  label: string;
+  summary: string;
+  services: readonly string[];
+  locked?: boolean;
+}
+
+const PROFILES: readonly ProfileSpec[] = [
+  {
+    id: 'required',
+    label: 'Traefik + Authelia',
+    summary: 'Reverse proxy with wildcard TLS, plus the SSO portal in front of every other app.',
+    services: ['traefik', 'authelia', 'authelia_postgres', 'authelia_redis'],
+    locked: true,
+  },
+  {
+    id: 'aiostreams',
+    label: 'AIOStreams',
+    summary: 'Stremio addon that merges streams from the sources you configure.',
+    services: ['aiostreams'],
+  },
+  {
+    id: 'aiometadata',
+    label: 'AIOMetadata',
+    summary: 'Stremio addon that serves metadata from TMDB and other providers, backed by Redis.',
+    services: ['aiometadata', 'aiometadata_redis'],
+  },
+  {
+    id: 'submaker',
+    label: 'SubMaker',
+    summary: 'Stremio subtitle addon that fetches and AI-translates subtitles, backed by Redis.',
+    services: ['submaker', 'submaker_redis'],
+  },
+  {
+    id: 'vaultwarden',
+    label: 'Vaultwarden',
+    summary: 'Bitwarden-compatible password vault.',
+    services: ['vaultwarden'],
+  },
+  {
+    id: 'immich',
+    label: 'Immich',
+    summary: 'Photo and video library with machine-learning search.',
+    services: ['immich', 'immich_machine-learning', 'immich_postgres', 'immich_redis'],
+  },
+  {
+    id: 'beszel',
+    label: 'Beszel',
+    summary: 'Host and container metrics with a web dashboard.',
+    services: ['beszel', 'beszel_agent'],
+  },
 ];
 
 function asString(value: unknown): string {
@@ -155,6 +210,9 @@ export function DeployTemplateModal({
 
   const ready = config !== null && selectedServerId !== '';
 
+  const selectedProfiles = PROFILES.filter((profile) => config?.profiles.includes(profile.id));
+  const serviceCount = selectedProfiles.reduce((total, profile) => total + profile.services.length, 0);
+
   return (
     <Modal
       title="Deploy VPS template"
@@ -182,108 +240,122 @@ export function DeployTemplateModal({
 
       {config && (
         <>
+          <Field label="Target host" htmlFor={serverId}>
+            <Select
+              id={serverId}
+              value={selectedServerId}
+              onChange={(event) => setSelectedServerId(event.target.value)}
+            >
+              {servers.length === 0 && <option value="">No hosts</option>}
+              {servers.map((server) => (
+                <option key={server.id} value={server.id}>
+                  {server.name} ({server.host})
+                </option>
+              ))}
+            </Select>
+          </Field>
+
           <div className="grid grid-cols-2 gap-4">
-            <div className="col gap-3">
-              <Field label="Target host" htmlFor={serverId}>
-                <Select
-                  id={serverId}
-                  value={selectedServerId}
-                  onChange={(event) => setSelectedServerId(event.target.value)}
-                >
-                  {servers.length === 0 && <option value="">No hosts</option>}
-                  {servers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.host})
-                    </option>
-                  ))}
-                </Select>
-              </Field>
+            <Field label="Primary domain" htmlFor={domainId} hint="Traefik routes every service under it">
+              <Input
+                id={domainId}
+                mono
+                value={config.domain}
+                placeholder="apps.example.com"
+                onChange={(event) => patch({ domain: event.target.value })}
+              />
+            </Field>
 
-              <Field label="Primary domain" htmlFor={domainId} hint="Traefik routes every service under it">
-                <Input
-                  id={domainId}
-                  mono
-                  value={config.domain}
-                  placeholder="apps.example.com"
-                  onChange={(event) => patch({ domain: event.target.value })}
-                />
-              </Field>
+            <Field label="ACME email" htmlFor={emailId} hint="Used for Let's Encrypt registration">
+              <Input
+                id={emailId}
+                mono
+                type="email"
+                value={config.email}
+                placeholder="admin@example.com"
+                onChange={(event) => patch({ email: event.target.value })}
+              />
+            </Field>
 
-              <Field label="ACME email" htmlFor={emailId} hint="Used for Let's Encrypt registration">
-                <Input
-                  id={emailId}
-                  mono
-                  type="email"
-                  value={config.email}
-                  placeholder="admin@example.com"
-                  onChange={(event) => patch({ email: event.target.value })}
-                />
-              </Field>
+            <Field label="Cloudflare API token" htmlFor={tokenId} hint="DNS-01 challenge for wildcard certificates">
+              <Input
+                id={tokenId}
+                mono
+                type="password"
+                value={config.cloudflare?.apiToken ?? ''}
+                placeholder="Token"
+                autoComplete="off"
+                onChange={(event) =>
+                  patch({
+                    cloudflare: {
+                      apiToken: event.target.value,
+                      zoneId: config.cloudflare?.zoneId ?? '',
+                    },
+                  })
+                }
+              />
+            </Field>
 
-              <Field label="Cloudflare API token" htmlFor={tokenId} hint="DNS-01 challenge for wildcard certificates">
-                <Input
-                  id={tokenId}
-                  mono
-                  type="password"
-                  value={config.cloudflare?.apiToken ?? ''}
-                  placeholder="Token"
-                  autoComplete="off"
-                  onChange={(event) =>
-                    patch({
-                      cloudflare: {
-                        apiToken: event.target.value,
-                        zoneId: config.cloudflare?.zoneId ?? '',
-                      },
-                    })
-                  }
-                />
-              </Field>
+            <Field label="Cloudflare zone ID" htmlFor={zoneId} hint="Zone that holds the wildcard record">
+              <Input
+                id={zoneId}
+                mono
+                value={config.cloudflare?.zoneId ?? ''}
+                placeholder="Zone ID"
+                autoComplete="off"
+                onChange={(event) =>
+                  patch({
+                    cloudflare: {
+                      apiToken: config.cloudflare?.apiToken ?? '',
+                      zoneId: event.target.value,
+                    },
+                  })
+                }
+              />
+            </Field>
+          </div>
 
-              <Field label="Cloudflare zone ID" htmlFor={zoneId}>
-                <Input
-                  id={zoneId}
-                  mono
-                  value={config.cloudflare?.zoneId ?? ''}
-                  placeholder="Zone ID"
-                  autoComplete="off"
-                  onChange={(event) =>
-                    patch({
-                      cloudflare: {
-                        apiToken: config.cloudflare?.apiToken ?? '',
-                        zoneId: event.target.value,
-                      },
-                    })
-                  }
-                />
-              </Field>
-            </div>
-
-            <div className="col gap-2">
-              <span className="field__label">Profiles</span>
-              <div className="panel">
-                <div className="panel__body col gap-1">
-                  {PROFILE_OPTIONS.map((profile) => (
-                    <Checkbox
-                      key={profile.id}
-                      checked={config.profiles.includes(profile.id)}
-                      disabled={profile.locked}
-                      onChange={() => toggleProfile(profile.id)}
-                      label={
+          <Section
+            title="What gets deployed"
+            actions={
+              <span className="field__hint">
+                <span className="num">{selectedProfiles.length}</span> of{' '}
+                <span className="num">{PROFILES.length}</span> profiles ·{' '}
+                <span className="num">{serviceCount}</span> services
+              </span>
+            }
+          >
+            <div className="panel">
+              <div className="panel__body col gap-1">
+                {PROFILES.map((profile) => (
+                  <Checkbox
+                    key={profile.id}
+                    className="check-row--block"
+                    checked={config.profiles.includes(profile.id)}
+                    disabled={profile.locked}
+                    onChange={() => toggleProfile(profile.id)}
+                    label={
+                      <span className="col gap-1 grow">
                         <span className="row">
                           <span>{profile.label}</span>
                           {profile.locked && <span className="label">always on</span>}
+                          <span className="grow" />
+                          <span className="label">
+                            {profile.services.length} {profile.services.length === 1 ? 'service' : 'services'}
+                          </span>
                         </span>
-                      }
-                    />
-                  ))}
-                </div>
+                        <span className="field__hint">{profile.summary}</span>
+                        <span className="profile-services">{profile.services.join(' · ')}</span>
+                      </span>
+                    }
+                  />
+                ))}
               </div>
-              <span className="field__hint">
-                <span className="num">{config.profiles.length}</span> of{' '}
-                <span className="num">{PROFILE_OPTIONS.length}</span> profiles selected
-              </span>
             </div>
-          </div>
+            <span className="field__hint">
+              Only ticked profiles start. The template ships many more services than this list.
+            </span>
+          </Section>
 
           <Banner tone="info" icon={<Shield size={13} strokeWidth={1.75} />}>
             Authelia JWT, session and storage secrets are generated per deploy and never reused.
