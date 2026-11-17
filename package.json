@@ -1,7 +1,7 @@
 {
   "name": "gantrycast",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.0-beta",
   "description": "GantryCast - Docker Fleet Management Dashboard",
   "author": "David Blachnitzky",
   "type": "module",
